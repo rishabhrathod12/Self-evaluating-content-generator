@@ -143,6 +143,11 @@ class EvaluationResult(_StrictModel):
         description="Combined actionable feedback for revising the lesson. "
         "Required when overall_pass is false, may be empty otherwise."
     )
+    notes: list[str] = Field(
+        default_factory=list,
+        description="Set by code, never by the model: records every issue that was "
+        "resolved automatically, with the matched definition and the reason.",
+    )
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:

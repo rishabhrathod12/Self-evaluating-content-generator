@@ -56,6 +56,9 @@ RUBRIC: tuple[RubricItem, ...] = (
             "A term is explained if the lesson defines it in plain words in the "
             "same sentence, the next sentence or the same paragraph as its first "
             "use, or earlier. Search the whole lesson before flagging a term.",
+            "Titles, section headings and the topic line are labels, not uses of "
+            "a term. Judge first use in the lesson body: the objectives, "
+            "explanations, examples, takeaways and summary.",
             "Report ALL unexplained terms, not just one, each with the term "
             "itself and an exact quote of its first use.",
         ),

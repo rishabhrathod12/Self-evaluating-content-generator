@@ -3,6 +3,8 @@
 import difflib
 import json
 import re
+from dataclasses import dataclass
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -161,6 +163,8 @@ def parse_evaluation(raw: str) -> EvaluationResult:
             f"response length {len(raw)} characters)."
         ) from exc
     _derive_failure_reasons(data)
+    if isinstance(data, dict):
+        data["notes"] = []  # notes are written by code only, never by the model
     try:
         return EvaluationResult.model_validate(data)
     except ValidationError as exc:
@@ -219,56 +223,240 @@ def closest_sentence(quote: str, lesson_text: str) -> str:
     )
 
 
-def find_definition(term: str, lesson_text: str) -> str | None:
-    """Return a snippet where the lesson defines ``term``, or ``None``.
+_LABEL_LINE = re.compile(r"^(?:Title|Topic|Learner level):|^Section \d+:")
+_ALLOWED_BEFORE = frozenset({"a", "an", "the", "called", "as", "named", "term", "word"})
+_ACRONYM = r"[A-Z][A-Z0-9]{1,}"
+_EXPANDS = r"(?:stands for|means|is short for|is an acronym for|refers to)"
 
-    A heuristic: the term followed by "is a/the/just...", "means", "refers to",
-    "stands for", or preceded by "called/known as".
-    """
-    text = _without_quote_marks(_normalize(lesson_text))
-    escaped = re.escape(_without_quote_marks(_normalize(term)))
-    patterns = (
-        rf"\b{escaped}\s+(?:{_DEFINITION_AFTER})",
-        rf"\b(?:called|known as|named)\s+(?:a |an |the )?{escaped}\b",
+
+@dataclass(frozen=True)
+class Definition:
+    """A definition found in the lesson: the original sentence and its pattern."""
+
+    sentence: str
+    kind: str
+
+
+def body_text(lesson: LessonContent) -> str:
+    """The lesson without label lines (title, topic, level, section headings)."""
+    lines = render_lesson(lesson).split("\n")
+    return "\n".join(line for line in lines if not _LABEL_LINE.match(line))
+
+
+def _sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _canon(text: str) -> str:
+    """Lowercase, drop quote marks, treat hyphens as spaces, collapse spaces."""
+    return re.sub(r"[\s\-]+", " ", _without_quote_marks(_normalize(text))).strip()
+
+
+def _initials_match(words: list[str], acronym: str) -> bool:
+    return len(words) == len(acronym) and all(
+        word[0].upper() == letter for word, letter in zip(words, acronym, strict=True)
     )
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            start = max(0, match.start() - 40)
-            return text[start : match.end() + 60].strip()
+
+
+def _acronym_pairs(sentence: str) -> list[tuple[str, str, str]]:
+    """Find (acronym, long form, pattern) pairs defined in ``sentence``.
+
+    Patterns: "Long Form (ACR)", "ACR (Long Form)" and "ACR stands for / means
+    Long Form". The long form's initials must spell the acronym.
+    """
+    pairs = []
+    for match in re.finditer(rf"\(\s*({_ACRONYM})\s*\)", sentence):
+        acronym = match.group(1)
+        words = re.findall(r"[A-Za-z][\w']*", sentence[: match.start()])
+        words = words[len(words) - len(acronym) :] if len(words) >= len(acronym) else []
+        if _initials_match(words, acronym):
+            pairs.append(
+                (acronym.lower(), _canon(" ".join(words)), "Long Form (ACRONYM)")
+            )
+    for match in re.finditer(rf"\b({_ACRONYM})\s*\(\s*([^)]+?)\s*\)", sentence):
+        acronym, words = match.group(1), re.findall(r"[A-Za-z][\w']*", match.group(2))
+        if _initials_match(words, acronym):
+            pairs.append(
+                (acronym.lower(), _canon(" ".join(words)), "ACRONYM (Long Form)")
+            )
+    pattern = rf"\b({_ACRONYM})\s+{_EXPANDS}\s+(?:the\s+)?([A-Za-z][\w'\- ]*)"
+    for match in re.finditer(pattern, sentence):
+        acronym = match.group(1)
+        words = re.findall(r"[A-Za-z][\w']*", match.group(2))[: len(acronym)]
+        if _initials_match(words, acronym):
+            pairs.append(
+                (acronym.lower(), _canon(" ".join(words)), "ACRONYM stands for")
+            )
+    return pairs
+
+
+def _plain_definition(wanted: str, sentence: str) -> str | None:
+    """Detect "X is a/the...", "X means...", "called X" and "X (two+ words)"."""
+    text = _canon(sentence)
+    for match in re.finditer(rf"(?<!\w){re.escape(wanted)}(?!\w)", text):
+        prefix, suffix = text[: match.start()], text[match.end() :]
+        previous = re.search(r"([a-z0-9']+)\s+$", prefix)
+        if previous and previous.group(1) not in _ALLOWED_BEFORE:
+            continue  # the term is only the tail of a longer phrase
+        if re.match(rf"\s*(?:{_DEFINITION_AFTER})", suffix):
+            return "X is/means ..."
+        if re.search(r"(?:called|known as|named)\s+(?:a |an |the )?$", prefix):
+            return "called X"
+        gloss = re.match(r"\s*\(([^)]*)\)", suffix)
+        if gloss:
+            inside = gloss.group(1).strip()
+            words = re.findall(r"[a-z0-9']+", inside)
+            if len(words) >= 2 and not inside.startswith(("see", "e.g", "cf")):
+                return "X (explanation)"
     return None
 
 
-def check_evidence(result: EvaluationResult, lesson: LessonContent) -> None:
-    """Verify the evaluation's evidence against the lesson text.
+def find_definition(term: str, lesson_text: str) -> Definition | None:
+    """Return the lesson sentence that defines exactly ``term``, or ``None``.
 
-    Raises:
-        EvidenceError: A quote is not in the lesson, or a term flagged as
-            unexplained is defined in the lesson.
+    Recognized: "X is a/the/just...", "X means/refers to/stands for...",
+    "called X", "X (a short explanation)", and acronym pairs in any of the forms
+    "Long Form (ACR)", "ACR (Long Form)", "ACR stands for/means Long Form".
+    Matching ignores case, quote marks and hyphens. A term that is only the tail
+    of a longer phrase ("retrieval" in "information retrieval is ...") is not
+    counted.
+    """
+    wanted = _canon(term)
+    if not wanted:
+        return None
+    for sentence in _sentences(lesson_text):
+        for acronym, long_form, kind in _acronym_pairs(sentence):
+            if wanted in (acronym, long_form):
+                return Definition(sentence, kind)
+        kind = _plain_definition(wanted, sentence)
+        if kind:
+            return Definition(sentence, kind)
+    return None
+
+
+def collect_evidence_problems(
+    result: EvaluationResult, lesson: LessonContent
+) -> tuple[list[str], list[str]]:
+    """Check the evaluation's evidence against the lesson.
+
+    Returns ``(invalid_quotes, contradicted_claims)``. Invalid quotes are never
+    acceptable. A contradicted claim is an "unexplained term" issue for a term the
+    lesson body defines.
     """
     lesson_text = render_lesson(lesson)
     lesson_norm = _normalize(lesson_text)
-    problems = []
+    body = body_text(lesson)
+    invalid: list[str] = []
+    contradicted: list[str] = []
     for check in result.checks:
         quotes = [check.evidence_quote] if check.passed else []
         quotes += [issue.quote for issue in check.issues]
         for quote in filter(str.strip, quotes):
             if not _quote_in_lesson(quote, lesson_norm):
-                problems.append(
+                invalid.append(
                     f"In '{check.criterion}' the quote \"{quote[:80]}\" does not "
                     "appear in the lesson. Closest text in the lesson: "
                     f'"{closest_sentence(quote, lesson_text)[:200]}".'
                 )
         if check.criterion == JARGON_CRITERION and not check.passed:
             for issue in check.issues:
-                found = find_definition(issue.term, lesson_text)
+                found = find_definition(issue.term, body)
                 if found:
-                    problems.append(
+                    contradicted.append(
                         f"You flagged '{issue.term}' as unexplained, but the lesson "
-                        f'defines it: "...{found}..."'
+                        f'defines it: "{found.sentence}". Remove this issue. If it '
+                        f"was the only issue for '{check.criterion}', mark that "
+                        "check as passed and give an evidence_quote."
                     )
-    if problems:
-        raise EvidenceError(" ".join(dict.fromkeys(problems)))
+    return list(dict.fromkeys(invalid)), list(dict.fromkeys(contradicted))
+
+
+def check_evidence(result: EvaluationResult, lesson: LessonContent) -> None:
+    """Raise ``EvidenceError`` if any quote is invalid or any claim contradicted."""
+    invalid, contradicted = collect_evidence_problems(result, lesson)
+    if invalid or contradicted:
+        raise EvidenceError(" ".join(invalid + contradicted))
+
+
+def resolve_contradictions(
+    result: EvaluationResult, lesson: LessonContent
+) -> EvaluationResult:
+    """Drop unexplained-term issues that the lesson provably defines.
+
+    Narrow and deterministic: only issues whose exact term has a recognized
+    definition in the lesson body are dropped. The jargon check passes only when
+    none of its issues remain, using the definition sentence as evidence. The
+    overall verdict, failure reasons and feedback are recomputed, and every
+    automatic resolution is recorded in ``notes``. Returns ``result`` unchanged
+    when nothing can be resolved.
+    """
+    body = body_text(lesson)
+    data = result.model_dump()
+    notes: list[str] = []
+    for index, check in enumerate(result.checks):
+        if check.passed or check.criterion != JARGON_CRITERION:
+            continue
+        remaining, resolved = [], []
+        for issue in check.issues:
+            found = find_definition(issue.term, body)
+            if found:
+                resolved.append((issue, found))
+            else:
+                remaining.append(issue)
+        if not resolved:
+            continue
+        for issue, found in resolved:
+            notes.append(
+                f"Resolved unexplained-term issue '{issue.term}': the lesson "
+                f'defines it ({found.kind}) in "{found.sentence}". Reason: a '
+                "recognized definition for exactly this term exists in the lesson "
+                "body, so the evaluator's claim was contradicted."
+            )
+        updated = data["checks"][index]
+        if remaining:
+            terms = ", ".join(issue.term for issue in remaining)
+            updated["issues"] = [issue.model_dump() for issue in remaining]
+            updated["reason"] = f"Unexplained terms remain: {terms}."
+            updated["improvement_suggestion"] = (
+                "Define these terms in plain words at or before their first use: "
+                f"{terms}."
+            )
+        else:
+            updated.update(
+                passed=True,
+                issues=[],
+                evidence_quote=resolved[0][1].sentence,
+                reason="Every flagged term is defined in the lesson, so its issues "
+                "were resolved automatically (see notes).",
+                improvement_suggestion="",
+            )
+            notes.append(
+                f"Check '{check.criterion}' was marked passed because all of its "
+                "issues were resolved."
+            )
+    if not notes:
+        return result
+    failed = [c for c in data["checks"] if not c["passed"]]
+    data["overall_pass"] = not failed
+    data["failure_reasons"] = [f"{c['criterion']}: {c['reason']}" for c in failed]
+    data["improvement_feedback"] = " ".join(
+        f"{c['criterion']}: {c['improvement_suggestion']}" for c in failed
+    )
+    notes.append(
+        "failure_reasons, overall_pass and improvement_feedback were recomputed "
+        "from the remaining failed checks."
+    )
+    data["notes"] = [*result.notes, *notes]
+    return EvaluationResult.model_validate(data)
+
+
+def api_schema() -> dict[str, Any]:
+    """The strict response schema sent to the API, without the code-only notes."""
+    schema = to_strict_json_schema(EvaluationResult)
+    schema["properties"].pop("notes", None)
+    schema["required"] = [name for name in schema["required"] if name != "notes"]
+    return schema
 
 
 # --- Public API --------------------------------------------------------------------
@@ -279,7 +467,9 @@ async def evaluate_lesson(lesson: LessonContent) -> EvaluationResult:
 
     This is an LLM judgement. It does not verify facts against external sources.
     Quotes are verified against the lesson text, and an invalid evaluation is
-    re-requested once before the error is raised.
+    re-requested once. If the retry still flags a term the lesson provably defines,
+    those issues are resolved in code and recorded in `notes`. Invalid quotes
+    raise `EvidenceError`.
 
     Raises:
         ConfigurationError: ``OPENAI_API_KEY`` is not configured (from the client).
@@ -292,18 +482,26 @@ async def evaluate_lesson(lesson: LessonContent) -> EvaluationResult:
         raw = await generate_text(
             prompt,
             instructions=SYSTEM_INSTRUCTIONS,
-            json_schema=to_strict_json_schema(EvaluationResult),
+            json_schema=api_schema(),
             schema_name="evaluation_result",
         )
         try:
             result = parse_evaluation(raw)
-            check_evidence(result, lesson)
-            return result
         except EvaluationError as exc:
             if attempt == 2:
                 raise
-            prompt = (
-                f"{build_prompt(lesson)}\n\nYour previous evaluation was rejected: "
-                f"{str(exc)[:500]}\nRe-evaluate the whole lesson and correct this."
-            )
+            feedback = str(exc)
+        else:
+            invalid, contradicted = collect_evidence_problems(result, lesson)
+            if not invalid and not contradicted:
+                return result
+            if attempt == 2:
+                if invalid:
+                    raise EvidenceError(" ".join(invalid + contradicted))
+                return resolve_contradictions(result, lesson)
+            feedback = " ".join(invalid + contradicted)
+        prompt = (
+            f"{build_prompt(lesson)}\n\nYour previous evaluation was rejected: "
+            f"{feedback[:1000]}\nRe-evaluate the whole lesson and correct this."
+        )
     raise AssertionError("unreachable")  # pragma: no cover

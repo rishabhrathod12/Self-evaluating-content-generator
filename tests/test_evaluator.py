@@ -8,9 +8,12 @@ from app.agents.evaluator import (
     EvaluationValidationError,
     EvidenceError,
     InvalidEvaluationJSONError,
+    body_text,
+    collect_evidence_problems,
     evaluate_lesson,
     find_definition,
     render_lesson,
+    resolve_contradictions,
 )
 from app.evaluation.schemas import (
     CRITERIA,
@@ -240,7 +243,7 @@ def test_evaluator_requests_structured_output(mock_llm):
     asyncio.run(evaluate_lesson(make_lesson()))
     kwargs = mock_llm.await_args.kwargs
     assert kwargs["schema_name"] == "evaluation_result"
-    assert kwargs["json_schema"] == to_strict_json_schema(EvaluationResult)
+    assert kwargs["json_schema"] == evaluator.api_schema()
 
 
 def test_valid_structured_response_accepted(mock_llm):
@@ -418,7 +421,7 @@ def test_claim_contradicted_by_lesson_is_rejected_then_corrected(monkeypatch):
     assert "defines it" in mock.await_args_list[1].args[0]
 
 
-def test_persistent_contradiction_raises_evidence_error(monkeypatch):
+def test_persistent_contradiction_is_resolved_in_code(monkeypatch):
     section = {
         "heading": "H",
         "explanation": "Information retrieval is the term used when a system searches.",
@@ -428,11 +431,15 @@ def test_persistent_contradiction_raises_evidence_error(monkeypatch):
         {**make_lesson().model_dump(), "sections": [section, section, section]}
     )
     bad = jargon_failure("information retrieval", "Information retrieval is the term")
-    monkeypatch.setattr(
-        evaluator, "generate_text", AsyncMock(return_value=json.dumps(bad))
-    )
-    with pytest.raises(EvidenceError, match="defines it"):
-        asyncio.run(evaluate_lesson(lesson))
+    mock = AsyncMock(return_value=json.dumps(bad))
+    monkeypatch.setattr(evaluator, "generate_text", mock)
+
+    result = asyncio.run(evaluate_lesson(lesson))
+
+    assert mock.await_count == 2  # one re-ask, then resolved in code
+    assert result.overall_pass is True
+    assert result.checks[3].passed is True
+    assert result.notes
 
 
 def test_genuinely_unexplained_term_is_still_reported(mock_llm):
@@ -549,3 +556,272 @@ def test_repeated_problems_are_deduplicated(mock_llm):
     with pytest.raises(EvidenceError) as info:
         run(None)
     assert str(info.value).count("Not in lesson") == 1
+
+
+# --- Acronym definitions, deterministic resolution, notes -------------------------
+
+RAG_BODY = (
+    "RAG stands for Retrieval-Augmented Generation. It is a method used in AI. "
+    "A database is a collection of organized data."
+)
+
+
+def lesson_with(*sentences: str, topic_line: str = "RAG") -> LessonContent:
+    base = make_lesson().model_dump()
+    section = {"heading": "H", "explanation": " ".join(sentences), "example": "X"}
+    return LessonContent.model_validate(
+        {**base, "topic": topic_line, "sections": [section, section, section]}
+    )
+
+
+def result_with_issues(issues: list[dict], extra_failing: tuple[int, ...] = ()):
+    """An EvaluationResult whose jargon check fails with the given issues."""
+    data = make_result(failing=(3, *extra_failing))
+    data["checks"][3]["issues"] = issues
+    return EvaluationResult.model_validate(
+        {**data, "improvement_feedback": "Original feedback."}
+    )
+
+
+def issue(
+    term: str, quote: str = "RAG stands for Retrieval-Augmented Generation."
+) -> dict:
+    return {"problem": f"{term} unexplained", "quote": quote, "term": term}
+
+
+@pytest.mark.parametrize(
+    ("term", "text", "kind_contains"),
+    [
+        ("RAG", "RAG stands for Retrieval-Augmented Generation.", ""),
+        ("RAG", "RAG means Retrieval-Augmented Generation.", ""),
+        (
+            "Retrieval-Augmented Generation",
+            "RAG stands for Retrieval-Augmented Generation.",
+            "stands for",
+        ),
+        (
+            "Retrieval-Augmented Generation",
+            "RAG means Retrieval-Augmented Generation.",
+            "stands for",
+        ),
+        ("RAG", "Retrieval-Augmented Generation (RAG) is a method.", "Long Form"),
+        (
+            "Retrieval-Augmented Generation",
+            "Retrieval-Augmented Generation (RAG) is a method.",
+            "Long Form",
+        ),
+        ("RAG", "RAG (Retrieval-Augmented Generation) is a method.", "ACRONYM"),
+        (
+            "Retrieval-Augmented Generation",
+            "RAG (Retrieval-Augmented Generation) is a method.",
+            "ACRONYM",
+        ),
+        ("AI", "Artificial Intelligence (AI) is everywhere.", "Long Form"),
+        (
+            "database",
+            "A database (a collection of organized data) is used.",
+            "explanation",
+        ),
+        (
+            "retrieval augmented generation",
+            "RAG stands for Retrieval-Augmented Generation.",
+            "stands for",
+        ),
+    ],
+)
+def test_acronym_and_plain_definitions_recognized(term, text, kind_contains):
+    found = find_definition(term, text)
+    assert found is not None
+    assert kind_contains in found.kind
+    assert found.sentence in text
+
+
+@pytest.mark.parametrize(
+    ("term", "text"),
+    [
+        ("RAG", "RAG is important because it helps."),
+        ("RAG", "RAG (see below) is covered later."),
+        ("Retrieval", "Information retrieval is the term used when searching."),
+        ("Augmented", "RAG stands for Retrieval-Augmented Generation."),
+        ("AI", "Retrieval-Augmented Generation (RAG) is a method."),
+        ("RAG", "Retrieval-Augmented Generation (XYZ) is a method."),
+        ("LLM", "RAG stands for Retrieval-Augmented Generation."),
+        ("", "RAG stands for Retrieval-Augmented Generation."),
+    ],
+)
+def test_non_definitions_are_not_recognized(term, text):
+    assert find_definition(term, text) is None
+
+
+def test_definition_sentence_keeps_original_capitalization():
+    found = find_definition(
+        "rag", "Intro. RAG stands for Retrieval-Augmented Generation."
+    )
+    assert found.sentence == "RAG stands for Retrieval-Augmented Generation."
+
+
+def test_label_lines_are_not_body_text():
+    lesson = lesson_with(
+        "Body sentence.", topic_line="RAG (Retrieval-Augmented Generation)"
+    )
+    body = body_text(lesson)
+    assert "Title:" not in body
+    assert "Topic:" not in body
+    assert "Learner level:" not in body
+    assert "Section 1:" not in body
+    assert "Body sentence." in body
+
+
+def test_definition_only_in_topic_label_does_not_count():
+    lesson = lesson_with(
+        "Machines look things up.", topic_line="RAG (Retrieval-Augmented Generation)"
+    )
+    result = result_with_issues([issue("RAG", "Machines look things up.")])
+    _, contradicted = collect_evidence_problems(result, lesson)
+    assert contradicted == []
+    assert resolve_contradictions(result, lesson) == result
+
+
+def test_resolve_sole_issue_passes_jargon_and_recomputes_everything():
+    lesson = lesson_with(RAG_BODY)
+    result = result_with_issues([issue("RAG")])
+    assert result.overall_pass is False
+
+    resolved = resolve_contradictions(result, lesson)
+
+    check = resolved.checks[3]
+    assert check.passed is True
+    assert check.issues == []
+    assert check.evidence_quote == "RAG stands for Retrieval-Augmented Generation."
+    assert resolved.overall_pass is True
+    assert resolved.failure_reasons == []
+    assert resolved.improvement_feedback == ""
+    assert len(resolved.notes) == 3
+    assert "'RAG'" in resolved.notes[0]
+    assert "RAG stands for Retrieval-Augmented Generation." in resolved.notes[0]
+    assert "contradicted" in resolved.notes[0]
+    assert "marked passed" in resolved.notes[1]
+    assert "recomputed" in resolved.notes[2]
+    # The original object is not mutated.
+    assert result.overall_pass is False
+    assert result.notes == []
+
+
+def test_resolve_mixed_issues_keeps_jargon_failed():
+    lesson = lesson_with(RAG_BODY)
+    result = result_with_issues([issue("RAG"), issue("Augmented", "It is a method")])
+
+    resolved = resolve_contradictions(result, lesson)
+
+    check = resolved.checks[3]
+    assert check.passed is False
+    assert [i.term for i in check.issues] == ["Augmented"]
+    assert "Augmented" in check.improvement_suggestion
+    assert "RAG" not in check.improvement_suggestion
+    assert resolved.overall_pass is False
+    assert resolved.failure_reasons == [f"{CRITERIA[3]}: {check.reason}"]
+    assert "Augmented" in resolved.improvement_feedback
+    assert "Original feedback." not in resolved.improvement_feedback
+    assert len(resolved.notes) == 2  # one resolution + the recompute note
+
+
+def test_resolve_keeps_other_failed_checks_and_rebuilds_feedback():
+    lesson = lesson_with(RAG_BODY)
+    result = result_with_issues([issue("RAG")], extra_failing=(6,))
+
+    resolved = resolve_contradictions(result, lesson)
+
+    assert resolved.checks[3].passed is True
+    assert resolved.checks[6].passed is False
+    assert resolved.overall_pass is False
+    assert resolved.failure_reasons == [f"{CRITERIA[6]}: Because."]
+    assert resolved.improvement_feedback == f"{CRITERIA[6]}: Fix it."
+    assert [c.passed for c in resolved.checks].count(False) == 1
+
+
+def test_resolve_leaves_unrelated_checks_untouched():
+    lesson = lesson_with(RAG_BODY)
+    result = result_with_issues([issue("RAG")], extra_failing=(1,))
+    resolved = resolve_contradictions(result, lesson)
+    assert resolved.checks[1] == result.checks[1]
+    assert resolved.checks[0] == result.checks[0]
+
+
+def test_resolve_does_nothing_when_no_term_is_defined():
+    lesson = lesson_with("Machines look things up.")
+    result = result_with_issues([issue("Augmented", "Machines look things up.")])
+    assert resolve_contradictions(result, lesson) is result
+
+
+def test_resolve_does_not_treat_a_bare_mention_as_a_definition():
+    lesson = lesson_with("RAG is important because it helps.")
+    result = result_with_issues([issue("RAG", "RAG is important because it helps.")])
+    assert resolve_contradictions(result, lesson) is result
+
+
+def test_retry_prompt_has_original_sentence_and_removal_instruction(monkeypatch):
+    lesson = lesson_with(RAG_BODY)
+    bad = result_with_issues([issue("RAG")]).model_dump()
+    mock = AsyncMock(return_value=json.dumps(bad))
+    monkeypatch.setattr(evaluator, "generate_text", mock)
+
+    asyncio.run(evaluate_lesson(lesson))
+
+    retry_prompt = mock.await_args_list[1].args[0]
+    assert '"RAG stands for Retrieval-Augmented Generation."' in retry_prompt
+    assert "Remove this issue" in retry_prompt
+    assert "mark that check as passed" in retry_prompt
+
+
+def test_second_attempt_with_invalid_quote_and_contradiction_still_raises(monkeypatch):
+    lesson = lesson_with(RAG_BODY)
+    data = result_with_issues([issue("RAG")]).model_dump()
+    data["checks"][0]["evidence_quote"] = "Invented sentence."
+    mock = AsyncMock(return_value=json.dumps(data))
+    monkeypatch.setattr(evaluator, "generate_text", mock)
+    with pytest.raises(EvidenceError, match="does not appear"):
+        asyncio.run(evaluate_lesson(lesson))
+
+
+def test_invented_quote_in_a_resolvable_issue_is_not_resolved(monkeypatch):
+    lesson = lesson_with(RAG_BODY)
+    data = result_with_issues([issue("RAG", "Made up quote")]).model_dump()
+    monkeypatch.setattr(
+        evaluator, "generate_text", AsyncMock(return_value=json.dumps(data))
+    )
+    with pytest.raises(EvidenceError, match="does not appear"):
+        asyncio.run(evaluate_lesson(lesson))
+
+
+def test_resolution_through_evaluate_lesson_records_notes(monkeypatch):
+    lesson = lesson_with(RAG_BODY)
+    bad = result_with_issues([issue("RAG")]).model_dump()
+    monkeypatch.setattr(
+        evaluator, "generate_text", AsyncMock(return_value=json.dumps(bad))
+    )
+    result = asyncio.run(evaluate_lesson(lesson))
+    assert result.overall_pass is True
+    assert any("Resolved unexplained-term issue 'RAG'" in n for n in result.notes)
+
+
+def test_model_supplied_notes_are_ignored(mock_llm):
+    data = make_result()
+    data["notes"] = ["The model says everything is fine."]
+    mock_llm.return_value = json.dumps(data)
+    assert run(None).notes == []
+
+
+def test_api_schema_omits_code_only_notes_and_stays_strict():
+    schema = evaluator.api_schema()
+    assert "notes" not in schema["properties"]
+    assert "notes" not in schema["required"]
+    assert schema["required"] == list(schema["properties"])
+    assert "notes" in to_strict_json_schema(EvaluationResult)["properties"]
+
+
+def test_rubric_says_labels_are_not_first_use():
+    from app.evaluation.rubric import get_item
+
+    text = " ".join(get_item(CRITERIA[3]).pass_when)
+    assert "labels" in text
+    assert "lesson body" in text
