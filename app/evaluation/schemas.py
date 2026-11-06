@@ -76,12 +76,21 @@ class EvaluationCheck(_StrictModel):
         "when it passes.",
     )
 
+    issues: list[NonEmptyStr] = Field(
+        default_factory=list,
+        description="Every specific problem found for this check, one item each "
+        "(name the exact term, section or missing piece). Required when the check "
+        "fails, empty when it passes.",
+    )
+
     @model_validator(mode="after")
-    def _failed_check_needs_suggestion(self) -> Self:
+    def _failed_check_needs_detail(self) -> Self:
         if not self.passed and not self.improvement_suggestion.strip():
             raise ValueError(
                 f"Failed check '{self.criterion}' needs an improvement_suggestion."
             )
+        if not self.passed and not self.issues:
+            raise ValueError(f"Failed check '{self.criterion}' needs issues.")
         return self
 
 

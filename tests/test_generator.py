@@ -103,3 +103,14 @@ def test_llm_error_propagates_unchanged(mock_llm):
     with pytest.raises(LLMError) as info:
         asyncio.run(generate_lesson("RAG"))
     assert info.value is error
+
+
+def test_instructions_include_rubric_and_depth_rules():
+    from app.evaluation.rubric import RUBRIC
+
+    text = generator.SYSTEM_INSTRUCTIONS
+    assert "{rubric}" not in text
+    for item in RUBRIC:
+        assert item.name in text
+    assert "technical term" in text
+    assert "4 to 6 sections" in text

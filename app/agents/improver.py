@@ -1,10 +1,13 @@
 """Improver agent: revises a lesson using the evaluator's feedback."""
 
 import json
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from pydantic import ValidationError
 
-from app.evaluation.schemas import EvaluationResult, LessonContent
+from app.evaluation.rubric import get_item
+from app.evaluation.schemas import EvaluationCheck, EvaluationResult, LessonContent
 from app.llm import generate_text
 
 
@@ -35,9 +38,16 @@ Audience: a learner with zero technical background, comparable to an Indian \
 plain words when it first appears.
 
 How to revise:
-- Fix only the checkpoints that failed, following the reviewer's suggestions.
-- Keep everything that already works. Preserve content from the passing \
-checkpoints, and keep the existing learning objectives wherever possible.
+- Fix every failed checkpoint, and fix ALL of its listed issues. Then sweep the \
+WHOLE lesson for the same kind of problem, because the reviewer lists only what \
+it noticed. For example, if jargon is flagged, define every technical term in \
+the lesson, not just the ones named. If depth is flagged, expand explanations \
+with the missing pieces named, adding or extending sections as needed.
+- Leave passing parts alone: keep section text that already satisfies its \
+checkpoints, and do not change learning_objectives, key_takeaways or summary \
+unless a failed checkpoint requires it. Do not undo earlier fixes.
+- If earlier rounds are listed, the same kind of problem has come back. Do not \
+repeat the earlier approach; be more thorough this time.
 - Keep the topic and learner_level exactly as in the original lesson.
 - Do not introduce facts you are not confident are correct. Prefer removing a \
 doubtful claim to inventing support for it.
@@ -52,21 +62,51 @@ at least 3 key takeaways.\
 """
 
 
-def build_prompt(lesson: LessonContent, evaluation: EvaluationResult) -> str:
-    """Build the revision prompt from the lesson and the failed/passed checks."""
+def _format_failed_check(check: EvaluationCheck) -> str:
+    issues = "\n".join(f"    * {issue}" for issue in check.issues)
+    return (
+        f"- {check.criterion}\n"
+        f"  Pass conditions: {' '.join(get_item(check.criterion).pass_when)}\n"
+        f"  Issues found:\n{issues}\n"
+        f"  Reviewer's reason: {check.reason}\n"
+        f"  Fix: {check.improvement_suggestion}"
+    )
+
+
+def _format_history(history: Sequence[Mapping[str, Any]]) -> str:
+    rounds = []
+    for entry in history:
+        rounds.append(
+            f"- Round {entry.get('attempt_number')}: failed "
+            f"{', '.join(entry.get('failed_criteria', []))}. "
+            f"Feedback was: {entry.get('improvement_feedback', '')} "
+            f"Changes then made: {'; '.join(entry.get('changes', [])) or 'none'}."
+        )
+    return "\n".join(rounds)
+
+
+def build_prompt(
+    lesson: LessonContent,
+    evaluation: EvaluationResult,
+    history: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    """Build the revision prompt from the lesson, the evaluation and past rounds."""
     failed = [c for c in evaluation.checks if not c.passed]
     passed = [c.criterion for c in evaluation.checks if c.passed]
-    failed_text = "\n".join(
-        f"- {c.criterion}\n  Problem: {c.reason}\n  Fix: {c.improvement_suggestion}"
-        for c in failed
-    )
+    failed_text = "\n".join(_format_failed_check(c) for c in failed)
     passed_text = "\n".join(f"- {name}" for name in passed) or "- (none)"
     schema = json.dumps(LessonContent.model_json_schema(), indent=2)
+    history_text = (
+        f"Earlier rounds that also failed:\n{_format_history(history)}\n\n"
+        if history
+        else ""
+    )
     return (
         "Revise the lesson below.\n\n"
         f"<lesson>\n{lesson.model_dump_json(indent=2)}\n</lesson>\n\n"
-        f"Failed checkpoints (fix these):\n{failed_text}\n\n"
+        f"Failed checkpoints (fix these, all issues):\n{failed_text}\n\n"
         f"Overall feedback:\n{evaluation.improvement_feedback}\n\n"
+        f"{history_text}"
         f"Passing checkpoints (preserve these):\n{passed_text}\n\n"
         f'Keep topic as "{lesson.topic}" and learner_level as '
         f'"{lesson.learner_level}".\n\n'
@@ -125,12 +165,15 @@ def _has_feedback(evaluation: EvaluationResult) -> bool:
 
 
 async def improve_lesson(
-    lesson: LessonContent, evaluation: EvaluationResult
+    lesson: LessonContent,
+    evaluation: EvaluationResult,
+    history: Sequence[Mapping[str, Any]] | None = None,
 ) -> LessonContent:
     """Return an improved lesson based on ``evaluation``.
 
-    If the evaluation passed, the original lesson is returned unchanged and the
-    LLM is not called. The result is not re-evaluated here.
+    `history` holds earlier failed rounds (rejection log entries), so the model
+    knows what was already tried. If the evaluation passed, the original lesson is
+    returned unchanged and the LLM is not called. The result is not re-evaluated here.
 
     Raises:
         MissingFeedbackError: The evaluation failed but has no usable feedback.
@@ -147,6 +190,6 @@ async def improve_lesson(
             "Evaluation failed but contains no improvement feedback."
         )
     raw = await generate_text(
-        build_prompt(lesson, evaluation), instructions=SYSTEM_INSTRUCTIONS
+        build_prompt(lesson, evaluation, history), instructions=SYSTEM_INSTRUCTIONS
     )
     return parse_improved_lesson(raw, lesson)

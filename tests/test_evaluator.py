@@ -43,6 +43,7 @@ def make_result(failing: tuple[int, ...] = ()) -> dict:
                 "passed": not failed,
                 "reason": "Because.",
                 "improvement_suggestion": "Fix it." if failed else "",
+                "issues": ["A specific problem."] if failed else [],
             }
         )
     return {
@@ -258,7 +259,7 @@ def test_empty_response_rejected(mock_llm):
         run(None)
 
 
-@pytest.mark.parametrize("missing", ["overall_pass", "checks", "failure_reasons"])
+@pytest.mark.parametrize("missing", ["overall_pass", "checks"])
 def test_missing_top_level_field_rejected(mock_llm, missing):
     data = make_result()
     del data[missing]
@@ -274,3 +275,42 @@ def test_missing_check_field_rejected(mock_llm, missing):
     mock_llm.return_value = json.dumps(data)
     with pytest.raises(EvaluationValidationError):
         run(None)
+
+
+# --- Rubric, exhaustive issues, derived failure reasons --------------------------
+
+
+def test_failed_check_without_issues_rejected(mock_llm):
+    data = make_result(failing=(3,))
+    data["checks"][3]["issues"] = []
+    mock_llm.return_value = json.dumps(data)
+    with pytest.raises(EvaluationValidationError, match="issues"):
+        run(None)
+
+
+def test_missing_failure_reasons_is_derived_not_rejected(mock_llm):
+    data = make_result(failing=(2,))
+    del data["failure_reasons"]
+    mock_llm.return_value = json.dumps(data)
+    assert len(run(None).failure_reasons) == 1
+
+
+def test_failure_reasons_derived_from_check_reasons(mock_llm):
+    data = make_result(failing=(1, 3))
+    data["failure_reasons"] = [CRITERIA[1], CRITERIA[3]]  # bare names, as seen live
+    data["checks"][1]["reason"] = "Uses the word 'ubiquitous'."
+    mock_llm.return_value = json.dumps(data)
+    result = run(None)
+    assert result.failure_reasons[0] == f"{CRITERIA[1]}: Uses the word 'ubiquitous'."
+    assert len(result.failure_reasons) == 2
+
+
+def test_instructions_contain_rubric_and_exhaustiveness_rule():
+    from app.evaluation.rubric import RUBRIC
+
+    text = evaluator.SYSTEM_INSTRUCTIONS
+    assert "{rubric}" not in text
+    for item in RUBRIC:
+        assert item.name in text
+        assert item.pass_when[0] in text
+    assert "EVERY problem" in text

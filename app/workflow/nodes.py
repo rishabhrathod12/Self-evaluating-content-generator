@@ -98,7 +98,10 @@ async def improve_node(state: WorkflowState) -> dict[str, Any]:
     lesson = LessonContent.model_validate(state["lesson"])
     evaluation = EvaluationResult.model_validate(state["evaluation"])
     try:
-        improved = await improve_lesson(lesson, evaluation)
+        # The last log entry is the current evaluation; the rest are earlier rounds.
+        improved = await improve_lesson(
+            lesson, evaluation, history=state["rejection_log"][:-1]
+        )
     except AGENT_ERRORS as exc:
         return _error_update("improve", exc)
 

@@ -42,6 +42,7 @@ def make_eval(failing: tuple[int, ...] = ()) -> EvaluationResult:
             "passed": i not in failing,
             "reason": "Because.",
             "improvement_suggestion": "Fix it." if i in failing else "",
+            "issues": ["A problem."] if i in failing else [],
         }
         for i, name in enumerate(CRITERIA)
     ]
@@ -59,7 +60,9 @@ def make_eval(failing: tuple[int, ...] = ()) -> EvaluationResult:
 def agents(monkeypatch):
     gen = AsyncMock(return_value=make_lesson("v1"))
     ev = AsyncMock(return_value=make_eval())
-    imp = AsyncMock(side_effect=lambda lesson, evaluation: make_lesson("improved"))
+    imp = AsyncMock(
+        side_effect=lambda lesson, evaluation, history=None: make_lesson("improved")
+    )
     monkeypatch.setattr(nodes, "generate_lesson", gen)
     monkeypatch.setattr(nodes, "evaluate_lesson", ev)
     monkeypatch.setattr(nodes, "improve_lesson", imp)
@@ -235,3 +238,15 @@ def test_default_attempts_come_from_settings(agents, monkeypatch):
     state = asyncio.run(run_workflow("RAG"))
     assert state["maximum_attempts"] == 1
     assert imp.await_count == 1
+
+
+def test_improver_receives_earlier_rounds_as_history(agents):
+    _, ev, imp = agents
+    ev.side_effect = [make_eval((1,)), make_eval((2,)), make_eval()]
+    run()
+    first_call, second_call = imp.await_args_list
+    assert first_call.kwargs["history"] == []
+    history = second_call.kwargs["history"]
+    assert len(history) == 1
+    assert history[0]["attempt_number"] == 1
+    assert history[0]["failed_criteria"] == [CRITERIA[1]]

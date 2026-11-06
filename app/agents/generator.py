@@ -4,6 +4,7 @@ import json
 
 from pydantic import ValidationError
 
+from app.evaluation.rubric import rubric_text
 from app.evaluation.schemas import LessonContent
 from app.llm import generate_text
 
@@ -37,17 +38,29 @@ term is unavoidable, explain it in plain words the first time it appears. \
 Prefer short sentences and everyday analogies.
 
 Every lesson must cover:
-1. What the topic is.
+1. What the topic is, including what kind of thing it is and what larger \
+system it belongs to or works with (for example, which kind of software or AI \
+it is used with).
 2. Why it matters.
-3. How it works, step by step.
+3. How it works, step by step, including how its parts interact.
 4. Practical, concrete examples.
+
+Depth: write 4 to 6 sections. Each explanation should be about 3 to 5 \
+sentences, and each section needs a specific, named example. Define every \
+technical term, acronym and specialized word (even common-sounding ones such \
+as "database") in plain words at or before its first use. Make sure every \
+learning objective is taught by a section and every key takeaway is supported \
+by the sections.
+
+Your lesson will be judged against this rubric, so write to it:
+{rubric}
 
 Be accurate. Do not invent facts.
 
 Output rules: respond with a single JSON object and nothing else. No markdown, \
 no code fences, no commentary. The JSON must match the schema you are given \
 exactly, with no extra fields.\
-"""
+""".replace("{rubric}", rubric_text())
 
 
 def build_prompt(topic: str) -> str:
@@ -56,7 +69,7 @@ def build_prompt(topic: str) -> str:
     return (
         f"Write a complete beginner-friendly lesson on: {topic}\n\n"
         "Set learner_level to describe a beginner with no technical background. "
-        "Include at least 2 learning objectives, at least 3 sections (each with a "
+        "Include at least 2 learning objectives, 4 to 6 sections (each with a "
         "heading, explanation and example) and at least 3 key takeaways.\n\n"
         f"JSON schema to follow:\n{schema}"
     )

@@ -38,6 +38,7 @@ def make_evaluation(failing: tuple[int, ...] = (2,)) -> EvaluationResult:
             "passed": i not in failing,
             "reason": f"Reason for {name}.",
             "improvement_suggestion": f"Fix {name}." if i in failing else "",
+            "issues": [f"Problem in {name}."] if i in failing else [],
         }
         for i, name in enumerate(CRITERIA)
     ]
@@ -150,3 +151,42 @@ def test_llm_error_propagates_unchanged(mock_llm):
     with pytest.raises(LLMError) as info:
         run()
     assert info.value is error
+
+
+# --- Issues, rubric and history in the prompt ------------------------------------
+
+
+def test_prompt_lists_issues_and_pass_conditions(mock_llm):
+    run(evaluation=make_evaluation(failing=(3,)))
+    prompt = mock_llm.await_args.args[0]
+    assert f"Problem in {CRITERIA[3]}." in prompt
+    assert "Pass conditions:" in prompt
+    assert "EVERY technical term" in prompt
+
+
+def test_history_included_when_given(mock_llm):
+    history = [
+        {
+            "attempt_number": 1,
+            "failed_criteria": [CRITERIA[3]],
+            "failure_reasons": ["x"],
+            "improvement_feedback": "Define 'augmented'.",
+            "changes": ["sections: 3 -> 5, 5 changed"],
+        }
+    ]
+    asyncio.run(improve_lesson(make_lesson(), make_evaluation(), history=history))
+    prompt = mock_llm.await_args.args[0]
+    assert "Earlier rounds that also failed" in prompt
+    assert "Define 'augmented'." in prompt
+    assert "sections: 3 -> 5, 5 changed" in prompt
+
+
+def test_no_history_section_when_none(mock_llm):
+    run()
+    assert "Earlier rounds" not in mock_llm.await_args.args[0]
+
+
+def test_instructions_require_sweep_and_scope_control():
+    text = improver.SYSTEM_INSTRUCTIONS
+    assert "sweep the WHOLE lesson" in text
+    assert "do not change learning_objectives" in text
