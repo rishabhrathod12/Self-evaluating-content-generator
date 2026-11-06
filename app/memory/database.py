@@ -1,1 +1,1 @@
-﻿"""SQLite engine and session setup (upcoming milestone)."""
+"""SQLite engine and session setup (upcoming milestone)."""

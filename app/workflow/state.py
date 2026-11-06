@@ -1,1 +1,1 @@
-﻿"""LangGraph workflow state schema (upcoming milestone)."""
+"""LangGraph workflow state schema (upcoming milestone)."""

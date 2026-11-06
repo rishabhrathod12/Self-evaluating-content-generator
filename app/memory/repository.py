@@ -1,1 +1,1 @@
-﻿"""Persistence repository for lessons and evaluations (upcoming milestone)."""
+"""Persistence repository for lessons and evaluations (upcoming milestone)."""

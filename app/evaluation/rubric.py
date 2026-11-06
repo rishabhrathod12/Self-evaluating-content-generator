@@ -1,1 +1,1 @@
-﻿"""Quality rubric definition (upcoming milestone)."""
+"""Quality rubric definition (upcoming milestone)."""

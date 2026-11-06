@@ -1,1 +1,1 @@
-﻿"""Lesson evaluator agent (upcoming milestone)."""
+"""Lesson evaluator agent (upcoming milestone)."""

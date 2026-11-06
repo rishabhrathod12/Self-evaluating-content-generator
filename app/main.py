@@ -1,1 +1,1 @@
-﻿"""FastAPI application entry point (upcoming milestone)."""
+"""FastAPI application entry point (upcoming milestone)."""
