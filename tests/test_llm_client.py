@@ -114,3 +114,29 @@ def test_close_client_closes_and_resets(monkeypatch):
 
     client.close.assert_awaited_once()
     assert llm_client._client is None
+
+
+def test_json_schema_sent_as_strict_structured_output(monkeypatch):
+    client = fake_client()
+    install(monkeypatch, client)
+    schema = {"type": "object", "properties": {}}
+
+    asyncio.run(generate_text("hi", json_schema=schema, schema_name="thing"))
+
+    assert client.responses.create.await_args.kwargs["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "thing",
+            "schema": schema,
+            "strict": True,
+        }
+    }
+
+
+def test_no_text_format_without_schema(monkeypatch):
+    client = fake_client()
+    install(monkeypatch, client)
+
+    asyncio.run(generate_text("hi"))
+
+    assert "text" not in client.responses.create.await_args.kwargs

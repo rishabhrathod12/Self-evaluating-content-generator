@@ -9,7 +9,12 @@ from app.agents.evaluator import (
     InvalidEvaluationJSONError,
     evaluate_lesson,
 )
-from app.evaluation.schemas import CRITERIA, EvaluationResult, LessonContent
+from app.evaluation.schemas import (
+    CRITERIA,
+    EvaluationResult,
+    LessonContent,
+    to_strict_json_schema,
+)
 from app.llm import LLMError
 
 
@@ -161,3 +166,111 @@ def test_full_lesson_and_instructions_passed(mock_llm):
     assert kwargs["instructions"] == evaluator.SYSTEM_INSTRUCTIONS
     for name in CRITERIA:
         assert name in evaluator.SYSTEM_INSTRUCTIONS
+
+
+# --- Structured output / real-world JSON handling regression tests ---------------
+
+
+def _walk_objects(node):
+    if isinstance(node, dict):
+        if "properties" in node:
+            yield node
+            for sub in node["properties"].values():
+                yield from _walk_objects(sub)
+        for key, value in node.items():
+            if key != "properties":
+                yield from _walk_objects(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_objects(item)
+
+
+def _all_keywords(node, found=None):
+    found = set() if found is None else found
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "properties":
+                for sub in value.values():
+                    _all_keywords(sub, found)
+            else:
+                found.add(key)
+                _all_keywords(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _all_keywords(item, found)
+    return found
+
+
+def test_strict_schema_meets_openai_strict_rules():
+    schema = to_strict_json_schema(EvaluationResult)
+    objects = list(_walk_objects(schema))
+    assert len(objects) >= 2  # EvaluationResult and EvaluationCheck
+    for obj in objects:
+        assert obj["additionalProperties"] is False
+        assert obj["required"] == list(obj["properties"])
+    unsupported = {"default", "minLength", "maxLength", "minItems", "maxItems"}
+    assert not unsupported & _all_keywords(schema)
+    assert set(CRITERIA) == set(
+        schema["$defs"]["EvaluationCheck"]["properties"]["criterion"]["enum"]
+    )
+
+
+def test_strict_schema_keeps_fields_named_like_keywords():
+    schema = to_strict_json_schema(LessonContent)
+    assert "title" in schema["properties"]
+    assert "title" in schema["required"]
+
+
+def test_evaluator_requests_structured_output(mock_llm):
+    asyncio.run(evaluate_lesson(make_lesson()))
+    kwargs = mock_llm.await_args.kwargs
+    assert kwargs["schema_name"] == "evaluation_result"
+    assert kwargs["json_schema"] == to_strict_json_schema(EvaluationResult)
+
+
+def test_valid_structured_response_accepted(mock_llm):
+    mock_llm.return_value = json.dumps(make_result(failing=(1,)))
+    result = run(None)
+    assert result.overall_pass is False
+    assert result.checks[1].criterion == CRITERIA[1]
+
+
+def test_unescaped_quote_in_string_rejected_without_leaking_text(mock_llm):
+    mock_llm.return_value = (
+        '{"overall_pass": true, "checks": [{"criterion": "x", '
+        '"reason": "The phrase "retrieval" is vague"}]}'
+    )
+    with pytest.raises(InvalidEvaluationJSONError) as info:
+        run(None)
+    assert "retrieval" not in str(info.value)
+    assert "response length" in str(info.value)
+
+
+def test_truncated_json_rejected(mock_llm):
+    mock_llm.return_value = json.dumps(make_result())[:200]
+    with pytest.raises(InvalidEvaluationJSONError):
+        run(None)
+
+
+def test_empty_response_rejected(mock_llm):
+    mock_llm.return_value = ""
+    with pytest.raises(InvalidEvaluationJSONError):
+        run(None)
+
+
+@pytest.mark.parametrize("missing", ["overall_pass", "checks", "failure_reasons"])
+def test_missing_top_level_field_rejected(mock_llm, missing):
+    data = make_result()
+    del data[missing]
+    mock_llm.return_value = json.dumps(data)
+    with pytest.raises(EvaluationValidationError):
+        run(None)
+
+
+@pytest.mark.parametrize("missing", ["criterion", "passed", "reason"])
+def test_missing_check_field_rejected(mock_llm, missing):
+    data = make_result()
+    del data["checks"][0][missing]
+    mock_llm.return_value = json.dumps(data)
+    with pytest.raises(EvaluationValidationError):
+        run(None)

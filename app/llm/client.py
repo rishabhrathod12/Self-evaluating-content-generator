@@ -1,5 +1,7 @@
 """Asynchronous OpenAI client built on the Responses API."""
 
+from typing import Any
+
 from openai import AsyncOpenAI, OpenAIError
 
 from app.config import get_settings
@@ -35,12 +37,20 @@ async def close_client() -> None:
         await client.close()
 
 
-async def generate_text(prompt: str, instructions: str | None = None) -> str:
+async def generate_text(
+    prompt: str,
+    instructions: str | None = None,
+    json_schema: dict[str, Any] | None = None,
+    schema_name: str = "response",
+) -> str:
     """Generate text with the configured model via ``responses.create()``.
 
     Args:
         prompt: The input text sent to the model.
         instructions: Optional system-level instructions for the model.
+        json_schema: Optional JSON Schema. When given, the API is asked for
+            strict structured output matching it (Structured Outputs).
+        schema_name: Name for the schema, used only with ``json_schema``.
 
     Returns:
         The model's text output.
@@ -50,12 +60,21 @@ async def generate_text(prompt: str, instructions: str | None = None) -> str:
         LLMError: If the OpenAI API call fails. The original error is chained.
     """
     client = get_client()
-    request: dict[str, str] = {
+    request: dict[str, Any] = {
         "model": get_settings().openai_model,
         "input": prompt,
     }
     if instructions is not None:
         request["instructions"] = instructions
+    if json_schema is not None:
+        request["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": schema_name,
+                "schema": json_schema,
+                "strict": True,
+            }
+        }
 
     try:
         response = await client.responses.create(**request)

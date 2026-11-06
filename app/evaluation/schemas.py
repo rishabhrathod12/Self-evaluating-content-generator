@@ -1,6 +1,6 @@
 """Pydantic schemas for lesson content."""
 
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -123,3 +123,37 @@ class EvaluationResult(_StrictModel):
             if not self.improvement_feedback.strip():
                 raise ValueError("improvement_feedback is required on failure.")
         return self
+
+
+_UNSUPPORTED_SCHEMA_KEYS = frozenset(
+    {"default", "minLength", "maxLength", "minItems", "maxItems"}
+)
+
+
+def to_strict_json_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """Return ``model``'s JSON Schema adapted for OpenAI strict structured output.
+
+    Strict mode needs every property listed as required and
+    ``additionalProperties: false`` on every object, and does not accept some
+    constraint keywords. Those constraints are dropped here only; Pydantic still
+    enforces them when the response is validated.
+    """
+
+    def convert(node: Any) -> Any:
+        if isinstance(node, list):
+            return [convert(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        converted: dict[str, Any] = {}
+        for key, value in node.items():
+            if key == "properties" and isinstance(value, dict):
+                # Keys here are field names, not schema keywords: keep them all.
+                converted[key] = {name: convert(sub) for name, sub in value.items()}
+            elif key not in _UNSUPPORTED_SCHEMA_KEYS:
+                converted[key] = convert(value)
+        if "properties" in converted:
+            converted["required"] = list(converted["properties"])
+            converted["additionalProperties"] = False
+        return converted
+
+    return convert(model.model_json_schema())

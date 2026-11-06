@@ -4,7 +4,11 @@ import json
 
 from pydantic import ValidationError
 
-from app.evaluation.schemas import EvaluationResult, LessonContent
+from app.evaluation.schemas import (
+    EvaluationResult,
+    LessonContent,
+    to_strict_json_schema,
+)
 from app.llm import generate_text
 
 
@@ -100,7 +104,8 @@ def parse_evaluation(raw: str) -> EvaluationResult:
         data = json.loads(_strip_code_fence(raw))
     except json.JSONDecodeError as exc:
         raise InvalidEvaluationJSONError(
-            f"Evaluator response is not valid JSON: {exc.msg} (position {exc.pos})."
+            f"Evaluator response is not valid JSON: {exc.msg} (position {exc.pos}, "
+            f"response length {len(raw)} characters)."
         ) from exc
     try:
         return EvaluationResult.model_validate(data)
@@ -124,5 +129,10 @@ async def evaluate_lesson(lesson: LessonContent) -> EvaluationResult:
         InvalidEvaluationJSONError: The response was not valid JSON.
         EvaluationValidationError: The response failed schema or consistency checks.
     """
-    raw = await generate_text(build_prompt(lesson), instructions=SYSTEM_INSTRUCTIONS)
+    raw = await generate_text(
+        build_prompt(lesson),
+        instructions=SYSTEM_INSTRUCTIONS,
+        json_schema=to_strict_json_schema(EvaluationResult),
+        schema_name="evaluation_result",
+    )
     return parse_evaluation(raw)
