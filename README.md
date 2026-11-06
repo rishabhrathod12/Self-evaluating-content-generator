@@ -6,7 +6,7 @@ An application that generates beginner-friendly educational lessons, evaluates e
 
 The initial submission topic is **Introduction to RAG (Retrieval-Augmented Generation)**.
 
-> **Status:** Foundation milestone only. Project structure and configuration exist; no agents, workflows, API logic, database operations, or LLM calls are implemented yet.
+> **Status:** Configuration (`app/config.py`) and the async OpenAI client (`app/llm/`) are implemented and tested. Agents, workflow, API logic and database operations are not implemented yet.
 
 ## Main Objective
 
@@ -18,7 +18,7 @@ Produce lesson content that reliably meets a defined quality bar by closing the 
 | --- | --- |
 | Language | Python 3.12 |
 | Orchestration | LangGraph, LangChain |
-| LLM | OpenAI (via `langchain-openai`) |
+| LLM | OpenAI Responses API (via the `openai` SDK, `AsyncOpenAI`) |
 | API | FastAPI, Uvicorn |
 | Validation / settings | Pydantic, pydantic-settings, python-dotenv |
 | Persistence | SQLite via SQLAlchemy |
@@ -99,8 +99,9 @@ Edit `.env` and set your own values:
 | `OPENAI_API_KEY` | Your OpenAI API key (never commit it) |
 | `OPENAI_MODEL` | Model used for generation and evaluation |
 | `DATABASE_URL` | SQLite connection string |
-| `MAX_REGENERATION_RETRIES` | Regeneration limit (default `2`) |
-| `APP_ENV`, `LOG_LEVEL`, `OUTPUT_DIR` | Runtime options |
+| `MAX_RETRIES` | Regeneration limit, 0-2 (default `2`) |
+| `APP_ENV` | `development`, `testing` or `production` (default `development`) |
+| `DEBUG` | Debug mode, `true` or `false` (default `false`) |
 
 `.env` is git-ignored; only `.env.example` (placeholders) is tracked.
 

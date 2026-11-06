@@ -32,7 +32,7 @@ On FAIL, the Improver receives the original lesson plus the evaluator's feedback
 The loop is a LangGraph state graph (`app/workflow/`): shared state (`state.py`), nodes for generate/evaluate/improve/persist (`nodes.py`), and a conditional edge after evaluation that routes to the improver, or to the end (`graph.py`).
 
 ### Maximum Two Regeneration Retries
-After the initial generation, at most **two** regenerations are allowed (up to three attempts total). The limit is configurable via `MAX_REGENERATION_RETRIES` (default `2`). If the lesson still fails, the final attempt is stored with a FAIL verdict rather than looping indefinitely.
+After the initial generation, at most **two** regenerations are allowed (up to three attempts total). The limit is configurable via `MAX_RETRIES` (0-2, default `2`). If the lesson still fails, the final attempt is stored with a FAIL verdict rather than looping indefinitely.
 
 ### SQLite Persistent Memory
 SQLite (via SQLAlchemy, `app/memory/`) persists every lesson attempt, its evaluation, and feedback, so history survives restarts and can be inspected or reused. Database files are git-ignored.
