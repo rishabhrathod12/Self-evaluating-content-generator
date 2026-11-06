@@ -22,6 +22,15 @@ RUBRIC: tuple[RubricItem, ...] = (
             "No claim contradicts well-established knowledge.",
             "No invented facts, statistics, names or dates.",
             "Examples agree with the explanations they illustrate.",
+            "No claims about real commercial products or services (for example, a "
+            "named assistant, search engine, app or company using the topic).",
+            "No speculative predictions about the future, and no guarantees or "
+            "certainty the topic cannot provide.",
+            "No abilities attributed to the topic that it does not have (such as "
+            "automatically learning, training or updating a model, remembering "
+            "users or personalizing).",
+            "For every failure, quote the exact problematic claim and state the "
+            "correct statement.",
             "The lesson correctly says what kind of thing the topic is and what "
             "larger system it belongs to or works with.",
             "You have no external sources: judge only from your own knowledge and "

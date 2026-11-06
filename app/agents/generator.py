@@ -4,8 +4,15 @@ import json
 
 from pydantic import ValidationError
 
+from app.debug_log import log_event
 from app.evaluation.rubric import rubric_text
 from app.evaluation.schemas import LessonContent
+from app.evaluation.topics import (
+    TopicRequirements,
+    concepts_text,
+    get_requirements,
+    guardrails_text,
+)
 from app.llm import generate_text
 
 MAX_TOPIC_LENGTH = 200
@@ -45,7 +52,8 @@ it is used with).
 3. How it works, step by step, including how its parts interact.
 4. Practical, concrete examples.
 
-Depth: write 4 to 6 sections. Each explanation should be about 3 to 5 \
+Depth: write 4 to 8 sections, as many as the topic needs. Each explanation \
+should be about 3 to 5 \
 sentences, and each section needs a specific, named example. Define every \
 technical term, acronym and specialized word (even common-sounding ones such \
 as "database") in plain words at or before its first use. Make sure every \
@@ -55,21 +63,31 @@ by the sections.
 Your lesson will be judged against this rubric, so write to it:
 {rubric}
 
-Be accurate. Do not invent facts.
+Be accurate. Do not invent facts. Accuracy rules you must follow:
+{guardrails}
 
 Output rules: respond with a single JSON object and nothing else. No markdown, \
 no code fences, no commentary. The JSON must match the schema you are given \
 exactly, with no extra fields.\
-""".replace("{rubric}", rubric_text())
+""".replace("{rubric}", rubric_text()).replace("{guardrails}", guardrails_text())
 
 
-def build_prompt(topic: str) -> str:
-    """Build the user prompt for a topic, including the required JSON schema."""
+def build_prompt(topic: str, requirements: TopicRequirements | None = None) -> str:
+    """Build the user prompt: the topic, mandatory concepts and the JSON schema."""
     schema = json.dumps(LessonContent.model_json_schema(), indent=2)
+    concepts = (
+        "You MUST teach every one of these mandatory concepts at beginner level, "
+        "each clearly and by name, using as many sections as needed (at most 8):\n"
+        f"{concepts_text(requirements)}\n\n"
+        "Topic-specific accuracy rules:\n"
+        f"{guardrails_text(requirements)}\n\n"
+        if requirements
+        else ""
+    )
     return (
-        f"Write a complete beginner-friendly lesson on: {topic}\n\n"
+        f"Write a complete beginner-friendly lesson on: {topic}\n\n{concepts}"
         "Set learner_level to describe a beginner with no technical background. "
-        "Include at least 2 learning objectives, 4 to 6 sections (each with a "
+        "Include at least 2 learning objectives, 4 to 8 sections (each with a "
         "heading, explanation and example) and at least 3 key takeaways.\n\n"
         f"JSON schema to follow:\n{schema}"
     )
@@ -133,5 +151,17 @@ async def generate_lesson(topic: str) -> LessonContent:
         LessonValidationError: The response did not match the schema.
     """
     cleaned = validate_topic(topic)
-    raw = await generate_text(build_prompt(cleaned), instructions=SYSTEM_INSTRUCTIONS)
-    return parse_lesson(raw)
+    raw = await generate_text(
+        build_prompt(cleaned, get_requirements(cleaned)),
+        instructions=SYSTEM_INSTRUCTIONS,
+    )
+    log_event("generator_response", raw=raw)
+    try:
+        return parse_lesson(raw)
+    except LessonGenerationError as exc:
+        log_event(
+            "generator_validation_failure",
+            error_type=type(exc).__name__,
+            message=str(exc),
+        )
+        raise

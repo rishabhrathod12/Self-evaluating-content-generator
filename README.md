@@ -101,9 +101,16 @@ Edit `.env` and set your own values:
 | `DATABASE_URL` | SQLite connection string |
 | `MAX_RETRIES` | Regeneration limit, 0-2 (default `2`) |
 | `APP_ENV` | `development`, `testing` or `production` (default `development`) |
-| `DEBUG` | Debug mode, `true` or `false` (default `false`) |
+| `DEBUG` | `true` writes model responses, re-asks and validation failures to `outputs/debug_log.jsonl` (git-ignored; API keys are redacted; default `false`) |
 
 `.env` is git-ignored; only `.env.example` (placeholders) is tracked.
+
+> **Warning:** with `DEBUG=true`, `outputs/debug_log.jsonl` contains the lesson
+> topic and the full text of generated lessons and evaluations. Prompts and API
+> keys are never written, and common credential formats are redacted, but the
+> lesson content itself is not. Treat the file as sensitive, do not enable debug
+> logging on a shared machine, and delete the log when you are done. It rotates
+> at 5 MB and keeps one backup (`debug_log.jsonl.1`).
 
 ## Development Tooling
 

@@ -21,6 +21,8 @@ class RejectionRecord(TypedDict):
     improvement_feedback: str
     another_attempt_made: bool
     changes: list[str]  # what the improver changed in response (filled in later)
+    missing_concepts: list[str]  # ids of mandatory concepts not taught
+    problem_sentences: list[str]  # exact lesson text the evaluator flagged
 
 
 class ErrorInfo(TypedDict):
@@ -43,6 +45,11 @@ class WorkflowState(TypedDict):
     status: WorkflowStatus
     rejection_log: list[RejectionRecord]
     error: ErrorInfo | None
+    best_lesson: dict[str, Any] | None  # highest-scoring evaluated lesson
+    best_evaluation: dict[str, Any] | None
+    best_evaluation_number: int  # which evaluation produced it (0 = none yet)
+    latest_lesson: dict[str, Any] | None  # set when a rejected run returns
+    latest_evaluation: dict[str, Any] | None  # an earlier, better version
 
 
 def initial_state(topic: str, maximum_attempts: int) -> WorkflowState:
@@ -57,4 +64,9 @@ def initial_state(topic: str, maximum_attempts: int) -> WorkflowState:
         status="in_progress",
         rejection_log=[],
         error=None,
+        best_lesson=None,
+        best_evaluation=None,
+        best_evaluation_number=0,
+        latest_lesson=None,
+        latest_evaluation=None,
     )

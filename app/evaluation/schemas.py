@@ -65,6 +65,7 @@ CRITERIA: tuple[str, ...] = CriterionName.__args__  # type: ignore[attr-defined]
 
 
 JARGON_CRITERION = CRITERIA[3]
+ACCURACY_CRITERION = CRITERIA[0]
 
 
 class EvaluationIssue(_StrictModel):
@@ -79,6 +80,11 @@ class EvaluationIssue(_StrictModel):
     term: str = Field(
         default="",
         description="For jargon issues only: the exact unexplained term.",
+    )
+    correction: str = Field(
+        default="",
+        description="For accuracy issues: what the correct statement is. Required "
+        "for accuracy failures.",
     )
 
 
@@ -122,6 +128,37 @@ class EvaluationCheck(_StrictModel):
                         "Each jargon issue needs the exact term and a quote of "
                         "its first use."
                     )
+        if not self.passed and self.criterion == ACCURACY_CRITERION:
+            for issue in self.issues:
+                if not issue.quote.strip() or not issue.correction.strip():
+                    raise ValueError(
+                        "Each accuracy issue needs the exact problematic "
+                        "claim (quote) and the correction."
+                    )
+        return self
+
+
+class ConceptCheck(_StrictModel):
+    """Whether the lesson teaches one mandatory concept."""
+
+    concept_id: NonEmptyStr = Field(description="Id of the mandatory concept.")
+    covered: bool = Field(description="True if the lesson teaches this concept.")
+    evidence_quote: str = Field(
+        default="",
+        description="Exact sentence copied from the lesson that teaches the concept. "
+        "Required when covered.",
+    )
+    missing_detail: str = Field(
+        default="",
+        description="Exactly what is missing. Required when not covered.",
+    )
+
+    @model_validator(mode="after")
+    def _evidence_or_detail(self) -> Self:
+        if self.covered and not self.evidence_quote.strip():
+            raise ValueError(f"Covered concept '{self.concept_id}' needs a quote.")
+        if not self.covered and not self.missing_detail.strip():
+            raise ValueError(f"Missing concept '{self.concept_id}' needs detail.")
         return self
 
 
@@ -142,6 +179,11 @@ class EvaluationResult(_StrictModel):
     improvement_feedback: str = Field(
         description="Combined actionable feedback for revising the lesson. "
         "Required when overall_pass is false, may be empty otherwise."
+    )
+    concept_checks: list[ConceptCheck] = Field(
+        default_factory=list,
+        description="One entry per mandatory concept listed in the prompt, or an "
+        "empty list when none are listed.",
     )
     notes: list[str] = Field(
         default_factory=list,

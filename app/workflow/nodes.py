@@ -7,6 +7,7 @@ from app.agents.generator import LessonGenerationError, generate_lesson
 from app.agents.improver import ImprovementError, improve_lesson
 from app.config import ConfigurationError
 from app.evaluation.schemas import EvaluationResult, LessonContent
+from app.evaluation.topics import get_requirements
 from app.llm import LLMError
 from app.workflow.state import RejectionRecord, WorkflowState
 
@@ -21,8 +22,21 @@ AGENT_ERRORS = (
 )
 
 
-def _error_update(node: str, exc: Exception) -> dict[str, Any]:
-    return {
+def _error_update(
+    node: str,
+    exc: Exception,
+    state: WorkflowState | None = None,
+    current_evaluated: bool = False,
+) -> dict[str, Any]:
+    """The state update for an agent failure.
+
+    If a lesson has already been evaluated, the best lesson is returned together
+    with its own evaluation. The current lesson, when it differs, is kept in
+    ``latest_lesson`` with its evaluation (``None`` if it was never evaluated).
+    Before any evaluation exists there is nothing to pair, so only the error is
+    recorded.
+    """
+    update: dict[str, Any] = {
         "status": "error",
         "error": {
             "node": node,
@@ -30,6 +44,36 @@ def _error_update(node: str, exc: Exception) -> dict[str, Any]:
             "message": str(exc),
         },
     }
+    if state is None or state["best_evaluation"] is None:
+        return update
+    best_lesson = state["best_lesson"]
+    update.update(lesson=best_lesson, evaluation=state["best_evaluation"])
+    if state["lesson"] != best_lesson:
+        update.update(
+            latest_lesson=state["lesson"],
+            latest_evaluation=state["evaluation"] if current_evaluated else None,
+        )
+    return update
+
+
+def evaluation_score(evaluation: dict[str, Any]) -> tuple[int, int]:
+    """Rank evaluations: more passed checks first, then more covered concepts."""
+    passed = sum(1 for check in evaluation["checks"] if check["passed"])
+    covered = sum(1 for c in evaluation.get("concept_checks", []) if c["covered"])
+    return passed, covered
+
+
+def _problem_sentences(evaluation: EvaluationResult) -> list[str]:
+    """Exact lesson text the evaluator flagged, without duplicates."""
+    sentences: list[str] = []
+    for check in evaluation.checks:
+        if check.passed:
+            continue
+        for issue in check.issues:
+            quote = issue.quote.strip()[:300]
+            if quote and quote not in sentences:
+                sentences.append(quote)
+    return sentences
 
 
 def summarize_changes(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
@@ -58,23 +102,40 @@ async def generate_node(state: WorkflowState) -> dict[str, Any]:
 
 
 async def evaluate_node(state: WorkflowState) -> dict[str, Any]:
-    """Evaluate the current lesson and decide the workflow status.
+    """Evaluate the current lesson, track the best one and set the status.
 
     PASS -> "passed". FAIL with attempts left -> "in_progress" (route to improve).
-    FAIL with no attempts left -> "rejected".
+    FAIL with no attempts left -> "rejected", returning the best-scoring lesson
+    evaluated so far (not necessarily the latest). Every evaluation covers all
+    seven criteria.
     """
     try:
         evaluation = await evaluate_lesson(
-            LessonContent.model_validate(state["lesson"])
+            LessonContent.model_validate(state["lesson"]),
+            requirements=get_requirements(state["topic"]),
         )
     except AGENT_ERRORS as exc:
-        return _error_update("evaluate", exc)
+        return _error_update("evaluate", exc, state)
 
     count = state["evaluation_count"] + 1
+    evaluation_dict = evaluation.model_dump()
     update: dict[str, Any] = {
-        "evaluation": evaluation.model_dump(),
+        "evaluation": evaluation_dict,
         "evaluation_count": count,
     }
+    best_lesson = state["best_lesson"]
+    best_evaluation = state["best_evaluation"]
+    best_number = state["best_evaluation_number"]
+    if best_evaluation is None or (
+        evaluation_score(evaluation_dict) > evaluation_score(best_evaluation)
+    ):
+        best_lesson, best_evaluation = state["lesson"], evaluation_dict
+        best_number = count
+        update.update(
+            best_lesson=best_lesson,
+            best_evaluation=best_evaluation,
+            best_evaluation_number=best_number,
+        )
     if evaluation.overall_pass:
         update["status"] = "passed"
         return update
@@ -87,9 +148,21 @@ async def evaluate_node(state: WorkflowState) -> dict[str, Any]:
         improvement_feedback=evaluation.improvement_feedback,
         another_attempt_made=attempts_remain,
         changes=[],
+        missing_concepts=[
+            c.concept_id for c in evaluation.concept_checks if not c.covered
+        ],
+        problem_sentences=_problem_sentences(evaluation),
     )
     update["rejection_log"] = [*state["rejection_log"], record]
     update["status"] = "in_progress" if attempts_remain else "rejected"
+    if not attempts_remain and best_number != count:
+        # The latest version is not the best one: return the best, keep the latest.
+        update.update(
+            lesson=best_lesson,
+            evaluation=best_evaluation,
+            latest_lesson=state["lesson"],
+            latest_evaluation=evaluation_dict,
+        )
     return update
 
 
@@ -100,10 +173,13 @@ async def improve_node(state: WorkflowState) -> dict[str, Any]:
     try:
         # The last log entry is the current evaluation; the rest are earlier rounds.
         improved = await improve_lesson(
-            lesson, evaluation, history=state["rejection_log"][:-1]
+            lesson,
+            evaluation,
+            history=state["rejection_log"][:-1],
+            requirements=get_requirements(state["topic"]),
         )
     except AGENT_ERRORS as exc:
-        return _error_update("improve", exc)
+        return _error_update("improve", exc, state, current_evaluated=True)
 
     new_lesson = improved.model_dump()
     log = [dict(record) for record in state["rejection_log"]]

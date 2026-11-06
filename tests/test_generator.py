@@ -113,4 +113,88 @@ def test_instructions_include_rubric_and_depth_rules():
     for item in RUBRIC:
         assert item.name in text
     assert "technical term" in text
-    assert "4 to 6 sections" in text
+    assert "4 to 8 sections" in text
+
+
+def test_rag_prompt_lists_every_mandatory_concept(mock_llm):
+    asyncio.run(generate_lesson("Introduction to RAG"))
+    prompt = mock_llm.await_args.args[0]
+    assert "mandatory concepts" in prompt
+    for name in (
+        "Definition of RAG",
+        "Why RAG is needed",
+        "What a language model (LLM) is",
+        "Retrieval",
+        "Augmentation",
+        "Generation",
+        "End-to-end interaction",
+        "Limitations",
+    ):
+        assert name in prompt
+
+
+def test_topic_without_requirements_has_no_concept_block(mock_llm):
+    asyncio.run(generate_lesson("Photosynthesis"))
+    assert "mandatory concepts" not in mock_llm.await_args.args[0]
+
+
+# --- Phase 2: accuracy guardrails --------------------------------------------------
+
+
+def test_instructions_contain_every_general_guardrail():
+    from app.evaluation.topics import GENERAL_GUARDRAILS
+
+    assert "{guardrails}" not in generator.SYSTEM_INSTRUCTIONS
+    for rule in GENERAL_GUARDRAILS:
+        assert rule in generator.SYSTEM_INSTRUCTIONS
+
+
+@pytest.mark.parametrize(
+    "needle",
+    [
+        "trains or updates the language model",
+        "guarantees correct answers",
+        "public internet",
+    ],
+)
+def test_rag_prompt_has_rag_specific_guardrails(mock_llm, needle):
+    asyncio.run(generate_lesson("Introduction to RAG"))
+    assert needle in mock_llm.await_args.args[0]
+
+
+def test_non_rag_prompt_has_no_rag_guardrails(mock_llm):
+    asyncio.run(generate_lesson("Photosynthesis"))
+    prompt = mock_llm.await_args.args[0]
+    assert "public internet" not in prompt
+    assert "trains or updates" not in prompt
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "commercial products or services",
+        "speculative predictions about the future",
+        "guarantees or certainty",
+        "Do not attribute other abilities",
+    ],
+)
+def test_general_guardrails_cover_the_required_cases(phrase):
+    assert phrase in generator.SYSTEM_INSTRUCTIONS
+
+
+def test_generator_logs_response_and_validation_failure(mock_llm, monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        generator, "log_event", lambda name, **fields: captured.append((name, fields))
+    )
+    asyncio.run(generate_lesson("RAG"))
+    assert [n for n, _ in captured] == ["generator_response"]
+
+    captured.clear()
+    mock_llm.return_value = "not json"
+    with pytest.raises(InvalidLessonJSONError):
+        asyncio.run(generate_lesson("RAG"))
+    assert [n for n, _ in captured] == [
+        "generator_response",
+        "generator_validation_failure",
+    ]
