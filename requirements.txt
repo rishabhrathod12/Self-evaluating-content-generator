@@ -1,0 +1,12 @@
+langgraph
+langchain
+langchain-openai
+openai
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+sqlalchemy
+pytest
+ruff
