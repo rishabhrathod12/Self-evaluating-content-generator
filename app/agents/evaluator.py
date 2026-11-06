@@ -1,5 +1,6 @@
 """Evaluation agent: judges a lesson against seven strict PASS/FAIL checkpoints."""
 
+import difflib
 import json
 import re
 
@@ -192,10 +193,30 @@ def _without_quote_marks(text: str) -> str:
     return text.replace("'", "").replace('"', "")
 
 
+_EDGE_CHARS = " .,;:!?\"'"
+
+
 def _quote_in_lesson(quote: str, lesson_norm: str) -> bool:
-    """True if every ellipsis-separated fragment of ``quote`` is in the lesson."""
-    fragments = [f for f in _ELLIPSIS.split(_normalize(quote)) if f.strip(" .")]
-    return bool(fragments) and all(f.strip() in lesson_norm for f in fragments)
+    """True if every ellipsis-separated fragment of ``quote`` is in the lesson.
+
+    Punctuation and quote marks at the two ends of a fragment are ignored, since
+    a quote cut mid-sentence often gains or loses them. The words and any inner
+    punctuation must still match exactly.
+    """
+    fragments = [f.strip(_EDGE_CHARS) for f in _ELLIPSIS.split(_normalize(quote))]
+    fragments = [f for f in fragments if f]
+    return bool(fragments) and all(f in lesson_norm for f in fragments)
+
+
+def closest_sentence(quote: str, lesson_text: str) -> str:
+    """Return the lesson sentence most similar to ``quote``."""
+    target = _normalize(quote)
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+|\n+", lesson_text) if s.strip()]
+    return max(
+        sentences,
+        key=lambda s: difflib.SequenceMatcher(None, _normalize(s), target).ratio(),
+        default="",
+    )
 
 
 def find_definition(term: str, lesson_text: str) -> str | None:
@@ -235,7 +256,8 @@ def check_evidence(result: EvaluationResult, lesson: LessonContent) -> None:
             if not _quote_in_lesson(quote, lesson_norm):
                 problems.append(
                     f"In '{check.criterion}' the quote \"{quote[:80]}\" does not "
-                    "appear in the lesson."
+                    "appear in the lesson. Closest text in the lesson: "
+                    f'"{closest_sentence(quote, lesson_text)[:200]}".'
                 )
         if check.criterion == JARGON_CRITERION and not check.passed:
             for issue in check.issues:
@@ -246,7 +268,7 @@ def check_evidence(result: EvaluationResult, lesson: LessonContent) -> None:
                         f'defines it: "...{found}..."'
                     )
     if problems:
-        raise EvidenceError(" ".join(problems))
+        raise EvidenceError(" ".join(dict.fromkeys(problems)))
 
 
 # --- Public API --------------------------------------------------------------------

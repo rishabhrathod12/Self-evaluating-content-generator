@@ -470,3 +470,82 @@ def test_curly_quotes_normalized():
 
     curly = "Ravi\N{RIGHT SINGLE QUOTATION MARK}s \N{LEFT DOUBLE QUOTATION MARK}x"
     assert _normalize(curly) == "ravi's \"x"
+
+
+# --- Edge-punctuation tolerance, closest-sentence hint, deduplication -------------
+
+
+def _lesson_with_sentence(sentence: str) -> LessonContent:
+    section = {"heading": "H", "explanation": sentence, "example": "X"}
+    return LessonContent.model_validate(
+        {**make_lesson().model_dump(), "sections": [section, section, section]}
+    )
+
+
+SENTENCE = (
+    "In simple terms, RAG helps a computer to look for information, like "
+    "searching in a library, and then use that information to write something."
+)
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "RAG helps a computer to look for information, like searching in a library.",
+        "rag helps a computer to look for information, like searching in a library",
+        '"RAG helps a computer to look for information, like searching in a library,"',
+        "In simple terms, RAG helps a computer",
+    ],
+)
+def test_quote_edge_punctuation_is_tolerated(monkeypatch, quote):
+    data = make_result()
+    data["checks"][1]["evidence_quote"] = quote
+    monkeypatch.setattr(
+        evaluator, "generate_text", AsyncMock(return_value=json.dumps(data))
+    )
+    result = asyncio.run(evaluate_lesson(_lesson_with_sentence(SENTENCE)))
+    assert result.overall_pass is True
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "RAG helps a computer to find information, like searching in a library.",
+        "RAG helps a computer to look for information like searching in a library",
+        "RAG helps computers to look for information, like searching in a library.",
+    ],
+)
+def test_changed_words_or_inner_punctuation_still_rejected(monkeypatch, quote):
+    data = make_result()
+    data["checks"][1]["evidence_quote"] = quote
+    monkeypatch.setattr(
+        evaluator, "generate_text", AsyncMock(return_value=json.dumps(data))
+    )
+    with pytest.raises(EvidenceError, match="does not appear"):
+        asyncio.run(evaluate_lesson(_lesson_with_sentence(SENTENCE)))
+
+
+def test_error_and_retry_prompt_show_closest_real_sentence(monkeypatch):
+    data = make_result()
+    data["checks"][1]["evidence_quote"] = (
+        "RAG helps a computer find stuff in a library."
+    )
+    mock = AsyncMock(return_value=json.dumps(data))
+    monkeypatch.setattr(evaluator, "generate_text", mock)
+    with pytest.raises(EvidenceError) as info:
+        asyncio.run(evaluate_lesson(_lesson_with_sentence(SENTENCE)))
+    assert "Closest text in the lesson" in str(info.value)
+    assert "like searching in a library" in str(info.value)
+    assert "Closest text in the lesson" in mock.await_args_list[1].args[0]
+
+
+def test_repeated_problems_are_deduplicated(mock_llm):
+    data = make_result(failing=(1,))
+    data["checks"][1]["issues"] = [
+        {"problem": "p", "quote": "Not in lesson", "term": ""},
+        {"problem": "q", "quote": "Not in lesson", "term": ""},
+    ]
+    mock_llm.return_value = json.dumps(data)
+    with pytest.raises(EvidenceError) as info:
+        run(None)
+    assert str(info.value).count("Not in lesson") == 1
