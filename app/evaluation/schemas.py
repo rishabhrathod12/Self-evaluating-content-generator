@@ -64,6 +64,24 @@ CriterionName = Literal[
 CRITERIA: tuple[str, ...] = CriterionName.__args__  # type: ignore[attr-defined]
 
 
+JARGON_CRITERION = CRITERIA[3]
+
+
+class EvaluationIssue(_StrictModel):
+    """One specific, evidence-backed problem found by the evaluator."""
+
+    problem: NonEmptyStr = Field(description="What is wrong, specifically.")
+    quote: str = Field(
+        default="",
+        description="Exact text copied from the lesson that shows the problem. "
+        "Empty only when the problem is something missing entirely.",
+    )
+    term: str = Field(
+        default="",
+        description="For jargon issues only: the exact unexplained term.",
+    )
+
+
 class EvaluationCheck(_StrictModel):
     """The independent PASS/FAIL verdict for one quality checkpoint."""
 
@@ -76,11 +94,15 @@ class EvaluationCheck(_StrictModel):
         "when it passes.",
     )
 
-    issues: list[NonEmptyStr] = Field(
+    evidence_quote: str = Field(
+        default="",
+        description="Exact sentence copied from the lesson that supports this "
+        "verdict. Required when the check passes.",
+    )
+    issues: list[EvaluationIssue] = Field(
         default_factory=list,
-        description="Every specific problem found for this check, one item each "
-        "(name the exact term, section or missing piece). Required when the check "
-        "fails, empty when it passes.",
+        description="Every specific problem found for this check, one item each. "
+        "Required when the check fails, empty when it passes.",
     )
 
     @model_validator(mode="after")
@@ -91,6 +113,15 @@ class EvaluationCheck(_StrictModel):
             )
         if not self.passed and not self.issues:
             raise ValueError(f"Failed check '{self.criterion}' needs issues.")
+        if self.passed and not self.evidence_quote.strip():
+            raise ValueError(f"Passed check '{self.criterion}' needs evidence_quote.")
+        if not self.passed and self.criterion == JARGON_CRITERION:
+            for issue in self.issues:
+                if not issue.term.strip() or not issue.quote.strip():
+                    raise ValueError(
+                        "Each jargon issue needs the exact term and a quote of "
+                        "its first use."
+                    )
         return self
 
 

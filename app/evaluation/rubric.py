@@ -50,11 +50,14 @@ RUBRIC: tuple[RubricItem, ...] = (
     RubricItem(
         "Clear explanations without unexplained jargon",
         (
-            "First list EVERY technical term, acronym and specialized word that a "
-            "non-technical learner might not know, anywhere in the lesson.",
-            "Pass only if each one is explained in plain words at or before its "
-            "first use.",
-            "If any are unexplained, report ALL of them, not just one.",
+            "Consider EVERY technical term, acronym and specialized word that a "
+            "non-technical learner might not know, anywhere in the lesson, "
+            "including the words that make up an acronym's name.",
+            "A term is explained if the lesson defines it in plain words in the "
+            "same sentence, the next sentence or the same paragraph as its first "
+            "use, or earlier. Search the whole lesson before flagging a term.",
+            "Report ALL unexplained terms, not just one, each with the term "
+            "itself and an exact quote of its first use.",
         ),
     ),
     RubricItem(

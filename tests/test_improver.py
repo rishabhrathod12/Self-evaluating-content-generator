@@ -38,7 +38,12 @@ def make_evaluation(failing: tuple[int, ...] = (2,)) -> EvaluationResult:
             "passed": i not in failing,
             "reason": f"Reason for {name}.",
             "improvement_suggestion": f"Fix {name}." if i in failing else "",
-            "issues": [f"Problem in {name}."] if i in failing else [],
+            "evidence_quote": "" if i in failing else "ok",
+            "issues": (
+                [{"problem": f"Problem in {name}.", "quote": "Intro", "term": "RAG"}]
+                if i in failing
+                else []
+            ),
         }
         for i, name in enumerate(CRITERIA)
     ]

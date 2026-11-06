@@ -63,7 +63,11 @@ at least 3 key takeaways.\
 
 
 def _format_failed_check(check: EvaluationCheck) -> str:
-    issues = "\n".join(f"    * {issue}" for issue in check.issues)
+    issues = "\n".join(
+        f"    * {issue.problem}"
+        + (f' (in the text: "{issue.quote}")' if issue.quote else "")
+        for issue in check.issues
+    )
     return (
         f"- {check.criterion}\n"
         f"  Pass conditions: {' '.join(get_item(check.criterion).pass_when)}\n"

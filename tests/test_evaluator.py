@@ -6,8 +6,11 @@ import pytest
 from app.agents import evaluator
 from app.agents.evaluator import (
     EvaluationValidationError,
+    EvidenceError,
     InvalidEvaluationJSONError,
     evaluate_lesson,
+    find_definition,
+    render_lesson,
 )
 from app.evaluation.schemas import (
     CRITERIA,
@@ -43,7 +46,18 @@ def make_result(failing: tuple[int, ...] = ()) -> dict:
                 "passed": not failed,
                 "reason": "Because.",
                 "improvement_suggestion": "Fix it." if failed else "",
-                "issues": ["A specific problem."] if failed else [],
+                "evidence_quote": "" if failed else "Intro to RAG",
+                "issues": (
+                    [
+                        {
+                            "problem": "A specific problem.",
+                            "quote": "Intro to RAG",
+                            "term": "RAG",
+                        }
+                    ]
+                    if failed
+                    else []
+                ),
             }
         )
     return {
@@ -163,7 +177,7 @@ def test_full_lesson_and_instructions_passed(mock_llm):
     lesson = make_lesson()
     asyncio.run(evaluate_lesson(lesson))
     args, kwargs = mock_llm.await_args
-    assert lesson.model_dump_json(indent=2) in args[0]
+    assert render_lesson(lesson) in args[0]
     assert kwargs["instructions"] == evaluator.SYSTEM_INSTRUCTIONS
     for name in CRITERIA:
         assert name in evaluator.SYSTEM_INSTRUCTIONS
@@ -314,3 +328,145 @@ def test_instructions_contain_rubric_and_exhaustiveness_rule():
         assert item.name in text
         assert item.pass_when[0] in text
     assert "EVERY problem" in text
+
+
+# --- Evidence verification, definition cross-check and re-ask ---------------------
+
+
+def jargon_failure(term: str, quote: str) -> dict:
+    data = make_result(failing=(3,))
+    data["checks"][3]["issues"] = [
+        {"problem": "Unexplained.", "quote": quote, "term": term}
+    ]
+    return data
+
+
+def test_lesson_rendered_as_plain_text_in_prompt(mock_llm):
+    lesson = make_lesson()
+    asyncio.run(evaluate_lesson(lesson))
+    prompt = mock_llm.await_args.args[0]
+    assert "Section 1: H" in prompt
+    assert "Learning objectives:" in prompt
+    assert '"learning_objectives"' not in prompt.split("JSON schema")[0]
+
+
+def test_passed_check_needs_evidence_quote(mock_llm):
+    data = make_result()
+    data["checks"][0]["evidence_quote"] = ""
+    mock_llm.return_value = json.dumps(data)
+    with pytest.raises(EvaluationValidationError, match="evidence_quote"):
+        run(None)
+
+
+def test_jargon_issue_needs_term_and_quote(mock_llm):
+    data = jargon_failure("", "Intro to RAG")
+    mock_llm.return_value = json.dumps(data)
+    with pytest.raises(EvaluationValidationError, match="exact term"):
+        run(None)
+
+
+def test_invented_quote_is_rejected(mock_llm):
+    data = make_result()
+    data["checks"][0]["evidence_quote"] = "This sentence is not in the lesson."
+    mock_llm.return_value = json.dumps(data)
+    with pytest.raises(EvidenceError, match="does not appear"):
+        run(None)
+    assert mock_llm.await_count == 2  # asked again once, then gave up
+
+
+def test_quote_matching_ignores_case_whitespace_curly_quotes_and_ellipsis(mock_llm):
+    data = make_result()
+    data["checks"][0]["evidence_quote"] = "INTRO   to RAG ... Topic: RAG"
+    mock_llm.return_value = json.dumps(data)
+    assert run(None).overall_pass is True
+
+
+def test_invalid_evaluation_is_re_asked_once_then_accepted(mock_llm):
+    bad = make_result()
+    bad["checks"][0]["evidence_quote"] = "Made up text."
+    mock_llm.side_effect = [json.dumps(bad), json.dumps(make_result())]
+    result = run(None)
+    assert result.overall_pass is True
+    assert mock_llm.await_count == 2
+    second_prompt = mock_llm.await_args_list[1].args[0]
+    assert "Your previous evaluation was rejected" in second_prompt
+    assert "Made up text." in second_prompt
+
+
+def test_claim_contradicted_by_lesson_is_rejected_then_corrected(monkeypatch):
+    section = {
+        "heading": "H",
+        "explanation": (
+            "Data is often called a 'database.' A database is just a way to store "
+            "information in an organized manner."
+        ),
+        "example": "X",
+    }
+    lesson = LessonContent.model_validate(
+        {
+            **make_lesson().model_dump(),
+            "sections": [section, section, section],
+        }
+    )
+    bad = jargon_failure("database", "often called a 'database.'")
+    mock = AsyncMock(side_effect=[json.dumps(bad), json.dumps(make_result())])
+    monkeypatch.setattr(evaluator, "generate_text", mock)
+
+    result = asyncio.run(evaluate_lesson(lesson))
+
+    assert result.overall_pass is True
+    assert "defines it" in mock.await_args_list[1].args[0]
+
+
+def test_persistent_contradiction_raises_evidence_error(monkeypatch):
+    section = {
+        "heading": "H",
+        "explanation": "Information retrieval is the term used when a system searches.",
+        "example": "X",
+    }
+    lesson = LessonContent.model_validate(
+        {**make_lesson().model_dump(), "sections": [section, section, section]}
+    )
+    bad = jargon_failure("information retrieval", "Information retrieval is the term")
+    monkeypatch.setattr(
+        evaluator, "generate_text", AsyncMock(return_value=json.dumps(bad))
+    )
+    with pytest.raises(EvidenceError, match="defines it"):
+        asyncio.run(evaluate_lesson(lesson))
+
+
+def test_genuinely_unexplained_term_is_still_reported(mock_llm):
+    mock_llm.return_value = json.dumps(jargon_failure("Intro", "Intro to RAG"))
+    result = run(None)
+    assert result.overall_pass is False
+    assert result.checks[3].issues[0].term == "Intro"
+
+
+@pytest.mark.parametrize(
+    ("term", "text", "expected"),
+    [
+        ("database", "often called a 'database.' A database is just a way", True),
+        (
+            "information retrieval",
+            "'Information retrieval' is the term used when",
+            True,
+        ),
+        ("RAG", "RAG stands for Retrieval-Augmented Generation.", True),
+        ("RAG", "RAG is important because it helps.", False),
+        (
+            "augmented",
+            "The word means nothing here, augmented stays unexplained.",
+            False,
+        ),
+        ("retrieval", "Retrieval means finding information.", True),
+    ],
+)
+def test_find_definition_heuristic(term, text, expected):
+    assert (find_definition(term, text) is not None) is expected
+
+
+def test_curly_quotes_normalized():
+    from app.agents.evaluator import _normalize
+
+    curly = "Ravi\N{RIGHT SINGLE QUOTATION MARK}s \N{LEFT DOUBLE QUOTATION MARK}x"
+    assert _normalize(curly) == "ravi's \"x"

@@ -1,11 +1,13 @@
 """Evaluation agent: judges a lesson against seven strict PASS/FAIL checkpoints."""
 
 import json
+import re
 
 from pydantic import ValidationError
 
 from app.evaluation.rubric import rubric_text
 from app.evaluation.schemas import (
+    JARGON_CRITERION,
     EvaluationResult,
     LessonContent,
     to_strict_json_schema,
@@ -23,6 +25,10 @@ class InvalidEvaluationJSONError(EvaluationError):
 
 class EvaluationValidationError(EvaluationError):
     """The evaluator response was JSON but did not match EvaluationResult."""
+
+
+class EvidenceError(EvaluationValidationError):
+    """The evaluation's quotes or claims are contradicted by the lesson text."""
 
 
 # --- Prompt construction (no validation logic here) -----------------------------
@@ -47,6 +53,15 @@ report only the first problem, because the lesson will be revised from your \
 list and re-judged.
 - Each check needs passed (true or false) and a specific reason that points to \
 the lesson's actual content.
+- Evidence is required and is verified by code. Every quote must be copied \
+EXACTLY, word for word, from the lesson. A passed check needs an evidence_quote: \
+an exact sentence that shows it passes. Each issue needs a quote of the exact \
+text it concerns (empty only if what is missing is absent from the lesson \
+entirely). Invented or altered quotes make the whole evaluation invalid.
+- For the jargon check, put the exact unexplained term in "term". Before \
+flagging a term, search the WHOLE lesson for a definition: if one exists in the \
+same sentence, the next sentence or the same paragraph, the term is explained \
+and must not be flagged.
 - Every failed check needs a concrete, actionable improvement_suggestion that \
 covers all of its issues. A passed check has empty issues.
 - overall_pass is true only if all seven checks pass.
@@ -61,12 +76,39 @@ fields.\
 """.replace("{rubric}", rubric_text())
 
 
+def render_lesson(lesson: LessonContent) -> str:
+    """Render the complete lesson as readable plain text for the evaluator."""
+    lines = [
+        f"Title: {lesson.title}",
+        f"Topic: {lesson.topic}",
+        f"Learner level: {lesson.learner_level}",
+        "",
+        "Learning objectives:",
+        *(f"- {item}" for item in lesson.learning_objectives),
+    ]
+    for number, section in enumerate(lesson.sections, 1):
+        lines += [
+            "",
+            f"Section {number}: {section.heading}",
+            section.explanation,
+            f"Example: {section.example}",
+        ]
+    lines += [
+        "",
+        "Key takeaways:",
+        *(f"- {item}" for item in lesson.key_takeaways),
+        "",
+        f"Summary: {lesson.summary}",
+    ]
+    return "\n".join(lines)
+
+
 def build_prompt(lesson: LessonContent) -> str:
     """Build the evaluation prompt containing the full lesson and the schema."""
     schema = json.dumps(EvaluationResult.model_json_schema(), indent=2)
     return (
         "Evaluate the following lesson.\n\n"
-        f"<lesson>\n{lesson.model_dump_json(indent=2)}\n</lesson>\n\n"
+        f"<lesson>\n{render_lesson(lesson)}\n</lesson>\n\n"
         f"JSON schema to follow:\n{schema}"
     )
 
@@ -126,6 +168,87 @@ def parse_evaluation(raw: str) -> EvaluationResult:
         ) from exc
 
 
+_QUOTE_CHARS = str.maketrans(  # curly quotes -> straight quotes
+    {
+        "\N{LEFT SINGLE QUOTATION MARK}": "'",
+        "\N{RIGHT SINGLE QUOTATION MARK}": "'",
+        "\N{LEFT DOUBLE QUOTATION MARK}": '"',
+        "\N{RIGHT DOUBLE QUOTATION MARK}": '"',
+    }
+)
+_ELLIPSIS = re.compile(r"\.\.\.|\N{HORIZONTAL ELLIPSIS}")
+_DEFINITION_AFTER = (
+    r"(?:is|are)\s+(?:a|an|the|just|simply|short for|used|when|what|how|another|"
+    r"called)\b|means\b|refers to\b|stands for\b|describes\b"
+)
+
+
+def _normalize(text: str) -> str:
+    """Casefold, straighten curly quotes and collapse whitespace."""
+    return re.sub(r"\s+", " ", text.translate(_QUOTE_CHARS)).strip().casefold()
+
+
+def _without_quote_marks(text: str) -> str:
+    return text.replace("'", "").replace('"', "")
+
+
+def _quote_in_lesson(quote: str, lesson_norm: str) -> bool:
+    """True if every ellipsis-separated fragment of ``quote`` is in the lesson."""
+    fragments = [f for f in _ELLIPSIS.split(_normalize(quote)) if f.strip(" .")]
+    return bool(fragments) and all(f.strip() in lesson_norm for f in fragments)
+
+
+def find_definition(term: str, lesson_text: str) -> str | None:
+    """Return a snippet where the lesson defines ``term``, or ``None``.
+
+    A heuristic: the term followed by "is a/the/just...", "means", "refers to",
+    "stands for", or preceded by "called/known as".
+    """
+    text = _without_quote_marks(_normalize(lesson_text))
+    escaped = re.escape(_without_quote_marks(_normalize(term)))
+    patterns = (
+        rf"\b{escaped}\s+(?:{_DEFINITION_AFTER})",
+        rf"\b(?:called|known as|named)\s+(?:a |an |the )?{escaped}\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            start = max(0, match.start() - 40)
+            return text[start : match.end() + 60].strip()
+    return None
+
+
+def check_evidence(result: EvaluationResult, lesson: LessonContent) -> None:
+    """Verify the evaluation's evidence against the lesson text.
+
+    Raises:
+        EvidenceError: A quote is not in the lesson, or a term flagged as
+            unexplained is defined in the lesson.
+    """
+    lesson_text = render_lesson(lesson)
+    lesson_norm = _normalize(lesson_text)
+    problems = []
+    for check in result.checks:
+        quotes = [check.evidence_quote] if check.passed else []
+        quotes += [issue.quote for issue in check.issues]
+        for quote in filter(str.strip, quotes):
+            if not _quote_in_lesson(quote, lesson_norm):
+                problems.append(
+                    f"In '{check.criterion}' the quote \"{quote[:80]}\" does not "
+                    "appear in the lesson."
+                )
+        if check.criterion == JARGON_CRITERION and not check.passed:
+            for issue in check.issues:
+                found = find_definition(issue.term, lesson_text)
+                if found:
+                    problems.append(
+                        f"You flagged '{issue.term}' as unexplained, but the lesson "
+                        f'defines it: "...{found}..."'
+                    )
+    if problems:
+        raise EvidenceError(" ".join(problems))
+
+
 # --- Public API --------------------------------------------------------------------
 
 
@@ -133,6 +256,8 @@ async def evaluate_lesson(lesson: LessonContent) -> EvaluationResult:
     """Evaluate ``lesson`` against the seven checkpoints.
 
     This is an LLM judgement. It does not verify facts against external sources.
+    Quotes are verified against the lesson text, and an invalid evaluation is
+    re-requested once before the error is raised.
 
     Raises:
         ConfigurationError: ``OPENAI_API_KEY`` is not configured (from the client).
@@ -140,10 +265,23 @@ async def evaluate_lesson(lesson: LessonContent) -> EvaluationResult:
         InvalidEvaluationJSONError: The response was not valid JSON.
         EvaluationValidationError: The response failed schema or consistency checks.
     """
-    raw = await generate_text(
-        build_prompt(lesson),
-        instructions=SYSTEM_INSTRUCTIONS,
-        json_schema=to_strict_json_schema(EvaluationResult),
-        schema_name="evaluation_result",
-    )
-    return parse_evaluation(raw)
+    prompt = build_prompt(lesson)
+    for attempt in (1, 2):
+        raw = await generate_text(
+            prompt,
+            instructions=SYSTEM_INSTRUCTIONS,
+            json_schema=to_strict_json_schema(EvaluationResult),
+            schema_name="evaluation_result",
+        )
+        try:
+            result = parse_evaluation(raw)
+            check_evidence(result, lesson)
+            return result
+        except EvaluationError as exc:
+            if attempt == 2:
+                raise
+            prompt = (
+                f"{build_prompt(lesson)}\n\nYour previous evaluation was rejected: "
+                f"{str(exc)[:500]}\nRe-evaluate the whole lesson and correct this."
+            )
+    raise AssertionError("unreachable")  # pragma: no cover
