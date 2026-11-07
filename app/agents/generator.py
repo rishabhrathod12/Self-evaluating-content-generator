@@ -58,9 +58,10 @@ it is used with).
 
 Depth: write as many sections as the topic's required content needs, and no \
 more. Never add filler, padding or speculative sections. Each explanation \
-should be about 3 to 5 sentences and must STATE its ideas explicitly in plain \
+should be detailed: about 8 to 12 sentences (roughly 150 to 250 words), \
+split into short paragraphs, and must STATE its ideas explicitly in plain \
 sentences; naming a step or a term is not teaching it. Each section needs a \
-specific, named example. Define every \
+specific, named example, explained in 2 to 4 sentences. Define every \
 technical term, acronym and specialized word (even common-sounding ones such \
 as "database") in plain words at or before its first use. Make sure every \
 learning objective is taught by a section and every key takeaway is supported \

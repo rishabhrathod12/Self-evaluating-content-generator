@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lesson Generator</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;color:#222;line-height:1.5}
+form{display:flex;gap:.5rem}input{flex:1;padding:.6rem;font-size:1rem}
+button{padding:.6rem 1.2rem;font-size:1rem;cursor:pointer}
+.badge{display:inline-block;padding:.15rem .6rem;border-radius:1rem;color:#fff;font-size:.85rem}
+.passed{background:#2e7d32}.rejected,.error{background:#c62828}
+.card{border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}
+.example{background:#f4f8ff;padding:.5rem .8rem;border-left:3px solid #4a7bd0}
+.ok{color:#2e7d32}.bad{color:#c62828}.muted{color:#777;font-size:.9rem}
+</style></head><body>
+<h1>Lesson Generator</h1>
+<form id="f"><input id="topic" placeholder="Enter a topic, e.g. Introduction to RAG" required minlength="2">
+<button id="go">Generate</button></form>
+<p class="muted">Generation calls the model several times and can take a minute or more.</p>
+<div id="out"></div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+$("f").onsubmit=async e=>{
+  e.preventDefault();$("go").disabled=true;$("out").innerHTML="<p>Generating and evaluating…</p>";
+  try{
+    const r=await fetch("/api/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({topic:$("topic").value})});
+    const d=await r.json();
+    if(!r.ok){$("out").innerHTML=`<p class="bad">${esc(d.error||d.detail&&JSON.stringify(d.detail))}</p>`;return}
+    render(d);
+  }catch(err){$("out").innerHTML=`<p class="bad">${esc(err)}</p>`}
+  finally{$("go").disabled=false}
+};
+function render(d){
+  const s=d.state,l=s.lesson||s.latest_lesson,ev=s.evaluation||s.latest_evaluation;
+  let h=`<p><span class="badge ${s.status}">${esc(s.status)}</span>
+    <span class="muted">evaluations: ${s.evaluation_count} · improvements: ${s.improvement_attempts} ·
+    saved as run ${d.run_id??"(not saved)"}</span></p>`;
+  if(s.rejection_reason)h+=`<p class="bad">${esc(s.rejection_reason)}</p>`;
+  if(s.error)h+=`<p class="bad">${esc(s.error.message)}</p>`;
+  if(l){
+    h+=`<h2>${esc(l.title)}</h2><p class="muted">${esc(l.learner_level)}</p>
+      <h3>Objectives</h3><ul>${l.learning_objectives.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>`;
+    l.sections.forEach((x,i)=>{h+=`<div class="card"><h3>${i+1}. ${esc(x.heading)}</h3>
+      <p>${esc(x.explanation).replace(/\n/g,"<br>")}</p><p class="example"><b>Example:</b> ${esc(x.example)}</p></div>`});
+    h+=`<h3>Key takeaways</h3><ul>${l.key_takeaways.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>
+      <h3>Summary</h3><p>${esc(l.summary)}</p>`;
+  }
+  if(ev&&ev.checks)h+=`<h3>Evaluation</h3><div class="card">${ev.checks.map(c=>
+    `<p><span class="${c.passed?"ok":"bad"}">${c.passed?"✔":"✘"}</span> <b>${esc(c.criterion)}</b><br><span class="muted">${esc(c.reason)}</span></p>`).join("")}</div>`;
+  h+=`<details><summary>Raw JSON</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`;
+  $("out").innerHTML=h;
+}
+</script></body></html>
