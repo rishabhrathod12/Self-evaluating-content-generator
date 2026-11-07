@@ -21,6 +21,7 @@ from typing import Any
 from app.llm import close_client
 from app.memory.context import build_memory_context
 from app.memory.database import MemoryDatabaseError
+from app.memory.evolution import propose_refinements
 from app.memory.repository import MemoryRepository
 from app.workflow.graph import run_workflow
 from app.workflow.state import WorkflowState
@@ -34,6 +35,7 @@ class MemoryRunResult:
     run_id: int | None  # None if the run could not be saved
     memory_context: dict[str, Any]  # what was retrieved ({} = no history)
     save_error: str | None = None
+    new_proposals: tuple[int, ...] = ()  # ids of new, unapproved prompt versions
 
 
 async def run_with_memory(
@@ -58,7 +60,13 @@ async def run_with_memory(
         run_id = memory.save_run(state)
     except MemoryDatabaseError as exc:
         return MemoryRunResult(state, None, context, save_error=str(exc))
-    return MemoryRunResult(state, run_id, context)
+    # Proposals only: they have no effect until a person approves them. A failure
+    # here must not hide that the run itself was saved.
+    try:
+        proposals = tuple(v.id for v in propose_refinements(memory, topic))
+    except MemoryDatabaseError:
+        proposals = ()
+    return MemoryRunResult(state, run_id, context, new_proposals=proposals)
 
 
 async def _main(topic: str) -> int:
@@ -80,6 +88,11 @@ async def _main(topic: str) -> int:
         print(f"NOT SAVED: {result.save_error}", file=sys.stderr)
     else:
         print(f"saved as run #{result.run_id}")
+    if result.new_proposals:
+        print(
+            f"new prompt proposals (unapproved, not used): {list(result.new_proposals)}"
+            " - review with: python -m app.evolve list"
+        )
     if state["rejection_reason"]:
         print("rejected because:", state["rejection_reason"])
     if state["error"]:

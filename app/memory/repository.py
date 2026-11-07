@@ -32,6 +32,44 @@ from app.memory.database import (
 
 
 @dataclass(frozen=True)
+class PromptVersion:
+    """A stored prompt-refinement proposal (see ``app.memory.evolution``)."""
+
+    id: int
+    topic: str
+    version: int  # per topic: 1, 2, 3, ...
+    pattern_key: str
+    failure_pattern: str
+    rationale: str
+    previous_instruction: str  # the approved instructions when this was proposed
+    proposed_instruction: str
+    created_at: str
+    status: str  # proposed | approved | rejected
+    decided_at: str | None
+
+
+_UNSAFE_PHRASES = (
+    "ignore",
+    "skip",
+    "relax",
+    "lenient",
+    "weaken",
+    "lower the",
+    "always pass",
+    "do not check",
+    "disregard",
+)
+
+
+def check_instruction_is_safe(text: str) -> None:
+    """Refuse instruction text that tries to weaken the evaluation standards."""
+    lowered = text.lower()
+    for phrase in _UNSAFE_PHRASES:
+        if phrase in lowered:
+            raise ValueError(f"Refinement may not weaken the standards ({phrase!r}).")
+
+
+@dataclass(frozen=True)
 class StoredRun:
     """A stored workflow run."""
 
@@ -265,6 +303,137 @@ class MemoryRepository:
             }
             for row in rows
         ]
+
+    # --- prompt versions -------------------------------------------------------------
+
+    def add_prompt_version(
+        self,
+        topic: str,
+        pattern_key: str,
+        failure_pattern: str,
+        rationale: str,
+        proposed_instruction: str,
+    ) -> PromptVersion | None:
+        """Store a new ``proposed`` refinement; ``None`` if the pattern has one already.
+
+        The version number is the next one for the topic, and the previous instruction
+        is the currently approved instruction text (empty if there is none).
+
+        Raises:
+            ValueError: The instruction would weaken the evaluation standards.
+        """
+        check_instruction_is_safe(proposed_instruction)
+        key = topic.strip().casefold()
+        previous = "\n".join(self.approved_instructions(topic))
+        with self._connection() as connection, connection:
+            if connection.execute(
+                "SELECT 1 FROM prompt_versions WHERE topic_key = ? AND pattern_key = ?",
+                (key, pattern_key),
+            ).fetchone():
+                return None
+            version = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM prompt_versions "
+                "WHERE topic_key = ?",
+                (key,),
+            ).fetchone()[0]
+            cursor = connection.execute(
+                "INSERT INTO prompt_versions (topic, topic_key, version, pattern_key, "
+                "failure_pattern, rationale, previous_instruction, "
+                "proposed_instruction, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    topic,
+                    key,
+                    version,
+                    pattern_key,
+                    failure_pattern,
+                    rationale,
+                    previous,
+                    proposed_instruction,
+                    datetime.now(UTC).isoformat(timespec="seconds"),
+                ),
+            )
+            new_id = int(cursor.lastrowid or 0)
+        found = self.get_prompt_version(new_id)
+        assert found is not None
+        return found
+
+    def get_prompt_version(self, version_id: int) -> PromptVersion | None:
+        """One stored prompt version, or ``None``."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM prompt_versions WHERE id = ?", (version_id,)
+            ).fetchone()
+        return self._prompt_version(row) if row else None
+
+    def list_prompt_versions(
+        self, topic: str | None = None, status: str | None = None
+    ) -> list[PromptVersion]:
+        """Prompt versions, oldest first, optionally for one topic and/or status."""
+        clauses, params = [], []
+        if topic is not None:
+            clauses.append("topic_key = ?")
+            params.append(topic.strip().casefold())
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM prompt_versions {where} ORDER BY id", params
+            ).fetchall()
+        return [self._prompt_version(row) for row in rows]
+
+    def set_prompt_status(self, version_id: int, status: str) -> PromptVersion:
+        """Approve or reject a proposal (a decided proposal cannot be changed).
+
+        Raises:
+            ValueError: Unknown id, invalid status, or the version was already decided.
+        """
+        if status not in ("approved", "rejected"):
+            raise ValueError("Status must be 'approved' or 'rejected'.")
+        with self._connection() as connection, connection:
+            cursor = connection.execute(
+                "UPDATE prompt_versions SET status = ?, decided_at = ? "
+                "WHERE id = ? AND status = 'proposed'",
+                (status, datetime.now(UTC).isoformat(timespec="seconds"), version_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(
+                    f"Prompt version {version_id} does not exist or is already decided."
+                )
+        found = self.get_prompt_version(version_id)
+        assert found is not None
+        return found
+
+    def approved_instructions(self, topic: str) -> list[str]:
+        """The approved refinement texts for a topic, in version order.
+
+        This is the only way refinements reach the agents: proposed and rejected
+        versions are never returned.
+        """
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT proposed_instruction FROM prompt_versions "
+                "WHERE topic_key = ? AND status = 'approved' ORDER BY version",
+                (topic.strip().casefold(),),
+            ).fetchall()
+        return [row["proposed_instruction"] for row in rows]
+
+    @staticmethod
+    def _prompt_version(row: sqlite3.Row) -> PromptVersion:
+        return PromptVersion(
+            id=row["id"],
+            topic=row["topic"],
+            version=row["version"],
+            pattern_key=row["pattern_key"],
+            failure_pattern=row["failure_pattern"],
+            rationale=row["rationale"],
+            previous_instruction=row["previous_instruction"],
+            proposed_instruction=row["proposed_instruction"],
+            created_at=row["created_at"],
+            status=row["status"],
+            decided_at=row["decided_at"],
+        )
 
     @staticmethod
     def _assemble(connection: sqlite3.Connection, run: sqlite3.Row) -> StoredRun:

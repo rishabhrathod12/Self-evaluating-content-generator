@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MEMORY_PATH = ":memory:"
 
 SCHEMA = """
@@ -55,6 +55,27 @@ CREATE TABLE IF NOT EXISTS rejection_log (
     failed_criteria_json TEXT NOT NULL,
     record_json TEXT NOT NULL,
     UNIQUE (run_id, attempt_number)
+);
+
+-- Proposed refinements to the generator/improver instructions. Only rows with
+-- status 'approved' are ever used. One proposal per (topic, failure pattern), ever,
+-- so a rejected proposal is not proposed again.
+CREATE TABLE IF NOT EXISTS prompt_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic TEXT NOT NULL,
+    topic_key TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    pattern_key TEXT NOT NULL,
+    failure_pattern TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    previous_instruction TEXT NOT NULL,
+    proposed_instruction TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'proposed'
+        CHECK (status IN ('proposed', 'approved', 'rejected')),
+    decided_at TEXT,
+    UNIQUE (topic_key, version),
+    UNIQUE (topic_key, pattern_key)
 );
 """
 

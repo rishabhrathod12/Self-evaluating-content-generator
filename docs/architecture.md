@@ -115,6 +115,26 @@ before any model call; a failed final save is reported in the result
 (error messages, rejection reason) is redacted for credentials first. Storage
 details and limitations are in the README's Memory section.
 
+## Controlled prompt evolution
+
+`app/memory/evolution.py` adds a human-gated feedback loop on top of the memory. It
+reuses the same SQLite file (table `prompt_versions`, schema version 2) and the same
+`MemoryRepository`; the graph, evaluator, rubric and retry limit are not involved.
+
+```text
+save_run -> detect_repeated_patterns  (same criterion/concept in >= 2 runs)
+         -> propose_refinements       (template text, deduplicated, status=proposed)
+person   -> python -m app.evolve approve|reject ID
+next run -> build_memory_context      (reads status='approved' only)
+         -> generator / improver prompt  ("approved refinements", emphasis only)
+```
+
+Design choices: proposals come from fixed templates over the rubric's pass conditions
+and the curriculum's teaching points, so they can only restate or add requirements;
+weakening wording is also refused when a version is stored. A pattern is unique per
+topic, so it is proposed once ever. Approval is the only path into prompts, and a
+decision is final. Without history the context stays empty and calls are unchanged.
+
 ## Not implemented
 
 An HTTP API (`app/api/`, `app/main.py` are placeholders).

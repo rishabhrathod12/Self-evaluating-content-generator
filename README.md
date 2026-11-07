@@ -245,7 +245,7 @@ run_id = memory.save_run(
 )  # state from run_workflow(...); run_with_memory does this
 ```
 
-**Schema** (`app/memory/database.py`, `PRAGMA user_version` = 1):
+**Schema** (`app/memory/database.py`, `PRAGMA user_version` = 2; version-1 databases are upgraded automatically):
 
 | Table | Holds |
 | --- | --- |
@@ -253,6 +253,7 @@ run_id = memory.save_run(
 | `lessons` | The returned lesson (`role = 'returned'`) and the latest lesson (`'latest'`) as JSON |
 | `evaluations` | The evaluation of each stored lesson: overall result, passed checks, covered concepts/points, notes, full JSON |
 | `rejection_log` | One row per rejection record, in attempt order |
+| `prompt_versions` | Prompt-refinement proposals and their approval status (see [Self-evolving prompts](#self-evolving-prompts)) |
 
 `save_run` writes a run in a single transaction, so a failure stores nothing. Child
 rows cascade when a run is deleted.
@@ -288,6 +289,64 @@ stored for inspection but are never returned by `latest_passed_lesson`.
 - Stored lessons and evaluations are plain text and may be sensitive; the database is
   not encrypted.
 
+## Self-evolving prompts
+
+A small, controlled mechanism learns from *repeated* failures of the same topic. It
+only ever adds emphasis to the generator and improver instructions, and nothing is
+used until a person approves it. It does not touch the seven criteria, evaluator
+scoring or the retry limit (2), and it contains no model call.
+
+**Exact behaviour**
+
+1. **Detect.** After each saved run, `app.memory.evolution` reads the stored rejection
+   logs of the topic. A failure is *repeated* when the same rubric criterion failed,
+   or the same concept stayed missing or weak, in at least **2 different runs**. A
+   run that fails the same check three times still counts once.
+2. **Propose.** Each repeated pattern gets one *proposed* instruction (at most 3 new
+   per call, most frequent first), built from a fixed template that quotes the
+   rubric's own pass conditions or the curriculum's own teaching points, for example
+   "Earlier drafts repeatedly left the concept 'Generation' missing or only partly
+   taught. Teach it clearly and state each of these points...". Instructions that
+   contain weakening wording (ignore, skip, relax, lenient, always pass, ...) are
+   refused at the storage layer.
+3. **Store.** Each proposal is a row in `prompt_versions`: per-topic version number,
+   previous instruction (the approved instructions at that moment), proposed
+   instruction, failure pattern, rationale (which runs, latest evaluator feedback),
+   UTC creation time, and status `proposed`. A pattern is proposed **once, ever**
+   (unique per topic and pattern), so duplicates are not created and a rejected
+   proposal does not come back.
+4. **Approve or reject** (a person, final decision):
+
+   ```powershell
+   .\.venv\Scripts\python.exe -m app.evolve list "Introduction to RAG"
+   .\.venv\Scripts\python.exe -m app.evolve approve 3
+   .\.venv\Scripts\python.exe -m app.evolve reject 4
+   ```
+
+   `python -m app.evolve propose "<topic>"` runs detection on demand.
+5. **Use.** `build_memory_context` reads **only approved** versions (at most the 5
+   newest, each clipped to 700 characters) into the context. The generator and
+   improver prompts show them as "Approved refinements ... they add emphasis only:
+   the rubric, the requirements and the pass standard are not changed by them".
+   Proposed and rejected versions are never read by any agent.
+
+With no history there are no patterns, no proposals and no approved instructions, so
+behaviour is exactly as before. Proposals appear after `python -m app.pipeline` runs;
+the run output lists new proposal ids.
+
+**Limitations**
+
+- Detection is by exact criterion name and concept id, and needs 2 runs; it cannot see
+  causes, only repetition. Concept patterns exist only for topics with a curriculum
+  (currently RAG).
+- Proposals are templates, not model-written analysis, so they are conservative and
+  repetitive. A single approval is trusted: nothing checks that an approved
+  refinement actually helps, and no effect on pass rates has been measured.
+- Approved refinements apply to the whole topic and stay until the database is edited;
+  there is no un-approve (a decision is final) or expiry.
+- Failures that came from an `error` status (API or JSON problems) leave no rejection
+  log, so they are not patterns.
+
 ## Live verification
 
 The memory-enabled workflow (`python -m app.pipeline "Introduction to RAG"`, model
@@ -316,7 +375,7 @@ need many paired runs, ideally on topics where an unaided run tends to be reject
 ## Testing
 
 ```powershell
-pytest                 # 491 tests, all offline: no API calls, no network
+pytest                 # 509 tests, all offline: no API calls, no network
 ruff check .
 ruff format --check .
 ```
@@ -335,8 +394,9 @@ app/
   agents/              generator, evaluator, improver
   evaluation/          rubric, topics (curriculum), schemas, concept logic
   workflow/            LangGraph state, nodes, graph
-  memory/              SQLite storage, retrieval and history context
+  memory/              SQLite storage, retrieval, history context, prompt evolution
   pipeline.py          memory-enabled entry point (python -m app.pipeline)
+  evolve.py            review prompt proposals (python -m app.evolve)
   api/, main.py        placeholders (not implemented)
 tests/                 offline tests and real-run fixtures
 docs/architecture.md   design notes
