@@ -140,3 +140,30 @@ def test_no_text_format_without_schema(monkeypatch):
     asyncio.run(generate_text("hi"))
 
     assert "text" not in client.responses.create.await_args.kwargs
+
+
+def test_temperature_is_sent_only_when_given(monkeypatch):
+    client = fake_client()
+    install(monkeypatch, client)
+
+    asyncio.run(generate_text("hi", temperature=0))
+    assert client.responses.create.await_args.kwargs["temperature"] == 0
+
+    asyncio.run(generate_text("hi"))
+    assert "temperature" not in client.responses.create.await_args.kwargs
+
+
+def test_temperature_and_schema_can_be_combined(monkeypatch):
+    client = fake_client()
+    install(monkeypatch, client)
+    asyncio.run(
+        generate_text(
+            "hi",
+            json_schema={"type": "object", "properties": {}},
+            schema_name="thing",
+            temperature=0.0,
+        )
+    )
+    kwargs = client.responses.create.await_args.kwargs
+    assert kwargs["temperature"] == 0.0
+    assert kwargs["text"]["format"]["name"] == "thing"

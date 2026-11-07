@@ -42,6 +42,7 @@ async def generate_text(
     instructions: str | None = None,
     json_schema: dict[str, Any] | None = None,
     schema_name: str = "response",
+    temperature: float | None = None,
 ) -> str:
     """Generate text with the configured model via ``responses.create()``.
 
@@ -51,6 +52,8 @@ async def generate_text(
         json_schema: Optional JSON Schema. When given, the API is asked for
             strict structured output matching it (Structured Outputs).
         schema_name: Name for the schema, used only with ``json_schema``.
+        temperature: Optional sampling temperature. Judging calls use 0 so the
+            same lesson gets the same verdict; omitted when ``None``.
 
     Returns:
         The model's text output.
@@ -66,6 +69,8 @@ async def generate_text(
     }
     if instructions is not None:
         request["instructions"] = instructions
+    if temperature is not None:
+        request["temperature"] = temperature
     if json_schema is not None:
         request["text"] = {
             "format": {

@@ -6,8 +6,10 @@ from app.agents.evaluator import EvaluationError, evaluate_lesson
 from app.agents.generator import LessonGenerationError, generate_lesson
 from app.agents.improver import ImprovementError, improve_lesson
 from app.config import ConfigurationError
+from app.evaluation.concepts import requested_point_ids, unaddressed_points
+from app.evaluation.lesson_text import body_text
 from app.evaluation.schemas import EvaluationResult, LessonContent
-from app.evaluation.topics import get_requirements
+from app.evaluation.topics import TopicRequirements, get_requirements
 from app.llm import LLMError
 from app.workflow.state import RejectionRecord, WorkflowState
 
@@ -56,11 +58,48 @@ def _error_update(
     return update
 
 
-def evaluation_score(evaluation: dict[str, Any]) -> tuple[int, int]:
-    """Rank evaluations: more passed checks first, then more covered concepts."""
+def evaluation_score(evaluation: dict[str, Any]) -> tuple[int, int, int]:
+    """Rank evaluations: passed checks, then covered concepts, then points."""
     passed = sum(1 for check in evaluation["checks"] if check["passed"])
-    covered = sum(1 for c in evaluation.get("concept_checks", []) if c["covered"])
-    return passed, covered
+    covered = sum(
+        1 for c in evaluation.get("concept_checks", []) if c["status"] == "covered"
+    )
+    points = sum(1 for p in evaluation.get("point_checks", []) if p["covered"])
+    return passed, covered, points
+
+
+def _concept_ids(evaluation: EvaluationResult, status: str) -> list[str]:
+    return [c.concept_id for c in evaluation.concept_checks if c.status == status]
+
+
+def _rejection_reason(
+    evaluation: EvaluationResult,
+    requirements: TopicRequirements | None,
+    state: WorkflowState,
+    count: int,
+    best_number: int,
+) -> str:
+    """Say exactly why the run was rejected, from the returned evaluation."""
+    parts = [
+        f"Rejected after {state['improvement_attempts']} improvement "
+        f"attempt(s) and {count} evaluation(s) (limit "
+        f"{state['maximum_attempts']})."
+    ]
+    failed = [c.criterion for c in evaluation.checks if not c.passed]
+    parts.append("Failed criteria: " + ", ".join(failed) + ".")
+    names = {c.id: c.name for c in requirements.concepts} if requirements else {}
+    for check in evaluation.concept_checks:
+        if check.status != "covered":
+            parts.append(
+                f"Concept '{names.get(check.concept_id, check.concept_id)}' "
+                f"is {check.status}: " + " ".join(dict.fromkeys(check.gaps))
+            )
+    if best_number != count:
+        parts.append(
+            f"The lesson from evaluation #{best_number} scored best and is "
+            "returned; the latest version is kept in latest_lesson."
+        )
+    return " ".join(parts)
 
 
 def _problem_sentences(evaluation: EvaluationResult) -> list[str]:
@@ -136,6 +175,16 @@ async def evaluate_node(state: WorkflowState) -> dict[str, Any]:
             best_evaluation=best_evaluation,
             best_evaluation_number=best_number,
         )
+    # The improvement that preceded this evaluation: did it fix its concepts?
+    log = [dict(record) for record in state["rejection_log"]]
+    if log and log[-1]["another_attempt_made"]:
+        was_open = set(log[-1]["missing_concepts"]) | set(log[-1]["weak_concepts"])
+        now_open = {
+            c.concept_id for c in evaluation.concept_checks if c.status != "covered"
+        }
+        log[-1]["concepts_resolved_next"] = sorted(was_open - now_open)
+        log[-1]["concepts_open_next"] = sorted(was_open & now_open)
+        update["rejection_log"] = log
     if evaluation.overall_pass:
         update["status"] = "passed"
         return update
@@ -148,21 +197,38 @@ async def evaluate_node(state: WorkflowState) -> dict[str, Any]:
         improvement_feedback=evaluation.improvement_feedback,
         another_attempt_made=attempts_remain,
         changes=[],
-        missing_concepts=[
-            c.concept_id for c in evaluation.concept_checks if not c.covered
-        ],
+        missing_concepts=_concept_ids(evaluation, "missing"),
+        weak_concepts=_concept_ids(evaluation, "weak"),
         problem_sentences=_problem_sentences(evaluation),
+        change_summary=(
+            "An improvement attempt follows this evaluation."
+            if attempts_remain
+            else "No improvement followed this evaluation: the "
+            "improvement-attempt limit was reached."
+        ),
+        improvement_unaddressed=[],
+        concepts_resolved_next=[],
+        concepts_open_next=[],
     )
-    update["rejection_log"] = [*state["rejection_log"], record]
+    update["rejection_log"] = [*log, record]
     update["status"] = "in_progress" if attempts_remain else "rejected"
-    if not attempts_remain and best_number != count:
-        # The latest version is not the best one: return the best, keep the latest.
-        update.update(
-            lesson=best_lesson,
-            evaluation=best_evaluation,
-            latest_lesson=state["lesson"],
-            latest_evaluation=evaluation_dict,
+    if not attempts_remain:
+        returned = (
+            evaluation
+            if best_number == count
+            else EvaluationResult.model_validate(best_evaluation)
         )
+        update["rejection_reason"] = _rejection_reason(
+            returned, get_requirements(state["topic"]), state, count, best_number
+        )
+        if best_number != count:
+            # The latest version is not the best one: return the best, keep the latest.
+            update.update(
+                lesson=best_lesson,
+                evaluation=best_evaluation,
+                latest_lesson=state["lesson"],
+                latest_evaluation=evaluation_dict,
+            )
     return update
 
 
@@ -182,8 +248,29 @@ async def improve_node(state: WorkflowState) -> dict[str, Any]:
         return _error_update("improve", exc, state, current_evaluated=True)
 
     new_lesson = improved.model_dump()
+    requirements = get_requirements(state["topic"])
+    unaddressed = [
+        p.id
+        for p in unaddressed_points(
+            requirements, body_text(improved), requested_point_ids(evaluation)
+        )
+    ]
+    changes = summarize_changes(state["lesson"], new_lesson)
     log = [dict(record) for record in state["rejection_log"]]
-    log[-1]["changes"] = summarize_changes(state["lesson"], new_lesson)
+    log[-1]["changes"] = changes
+    log[-1]["improvement_unaddressed"] = unaddressed
+    log[-1]["change_summary"] = (
+        f"Improvement attempt {state['improvement_attempts'] + 1} changed: "
+        + "; ".join(changes)
+        + "."
+        + (
+            " The revision did NOT state these requested points: "
+            + ", ".join(unaddressed)
+            + "."
+            if unaddressed
+            else ""
+        )
+    )
     return {
         "lesson": new_lesson,
         "improvement_attempts": state["improvement_attempts"] + 1,

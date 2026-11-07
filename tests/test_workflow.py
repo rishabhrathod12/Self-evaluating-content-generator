@@ -344,15 +344,19 @@ def test_passing_lesson_is_the_best(agents):
 
 
 def test_evaluation_score_ranks_passes_then_covered_concepts():
-    def ev(passed, covered):
+    def ev(passed, covered, points=0):
         return {
             "checks": [{"passed": i < passed} for i in range(7)],
-            "concept_checks": [{"covered": i < covered} for i in range(8)],
+            "concept_checks": [
+                {"status": "covered" if i < covered else "weak"} for i in range(8)
+            ],
+            "point_checks": [{"covered": i < points} for i in range(12)],
         }
 
     assert evaluation_score(ev(6, 0)) > evaluation_score(ev(5, 8))
     assert evaluation_score(ev(5, 6)) > evaluation_score(ev(5, 3))
-    assert evaluation_score({"checks": [{"passed": True}]}) == (1, 0)
+    assert evaluation_score(ev(5, 3, 10)) > evaluation_score(ev(5, 3, 4))
+    assert evaluation_score({"checks": [{"passed": True}]}) == (1, 0, 0)
 
 
 def test_every_improvement_is_followed_by_a_full_seven_check_evaluation(agents):
@@ -372,15 +376,24 @@ def test_rejection_log_records_missing_concepts_and_problem_sentences(agents):
     failing["concept_checks"] = [
         {
             "concept_id": "augmentation",
-            "covered": False,
-            "evidence_quote": "",
-            "missing_detail": "Not taught.",
+            "status": "missing",
+            "missing_points": ["augmentation.added_as_context"],
+            "gaps": ["Not taught."],
+            "evidence_quotes": [],
+        },
+        {
+            "concept_id": "why_needed",
+            "status": "weak",
+            "missing_points": ["why.hallucination"],
+            "gaps": ["No mention of made-up answers."],
+            "evidence_quotes": ["x"],
         },
         {
             "concept_id": "definition",
-            "covered": True,
-            "evidence_quote": "Intro",
-            "missing_detail": "",
+            "status": "covered",
+            "missing_points": [],
+            "gaps": [],
+            "evidence_quotes": ["Intro"],
         },
     ]
     failing["checks"][6]["issues"] = [
@@ -395,6 +408,7 @@ def test_rejection_log_records_missing_concepts_and_problem_sentences(agents):
     state = run()
     entry = state["rejection_log"][0]
     assert entry["missing_concepts"] == ["augmentation"]
+    assert entry["weak_concepts"] == ["why_needed"]
     assert entry["problem_sentences"] == ["The exact flagged sentence."]
 
 

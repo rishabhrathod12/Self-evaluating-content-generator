@@ -113,29 +113,37 @@ def test_instructions_include_rubric_and_depth_rules():
     for item in RUBRIC:
         assert item.name in text
     assert "technical term" in text
-    assert "4 to 8 sections" in text
+    assert "no more" in text
+    assert "Never add filler" in text
+    assert "STATE its ideas explicitly" in text
 
 
-def test_rag_prompt_lists_every_mandatory_concept(mock_llm):
+def test_rag_prompt_lists_every_concept_and_teaching_point(mock_llm):
     asyncio.run(generate_lesson("Introduction to RAG"))
     prompt = mock_llm.await_args.args[0]
-    assert "mandatory concepts" in prompt
+    assert "You MUST teach every concept below" in prompt
     for name in (
         "Definition of RAG",
         "Why RAG is needed",
         "What a language model (LLM) is",
-        "Retrieval",
+        "Knowledge source and retrieval",
         "Augmentation",
         "Generation",
-        "End-to-end interaction",
+        "End-to-end workflow",
         "Limitations",
     ):
         assert name in prompt
+    # the concrete points, not just names
+    assert "reads the question together with the retrieved context" in prompt
+    assert "added to the user's question as context" in prompt
+    assert "does not guarantee that answers are accurate" in prompt
 
 
 def test_topic_without_requirements_has_no_concept_block(mock_llm):
     asyncio.run(generate_lesson("Photosynthesis"))
-    assert "mandatory concepts" not in mock_llm.await_args.args[0]
+    prompt = mock_llm.await_args.args[0]
+    assert "You MUST teach every concept below" not in prompt
+    assert "workflow" not in prompt.lower().split("json schema")[0]
 
 
 # --- Phase 2: accuracy guardrails --------------------------------------------------

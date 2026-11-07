@@ -12,6 +12,7 @@ from app.evaluation.topics import (
     concepts_text,
     get_requirements,
     guardrails_text,
+    workflow_text,
 )
 from app.llm import generate_text
 
@@ -52,9 +53,11 @@ it is used with).
 3. How it works, step by step, including how its parts interact.
 4. Practical, concrete examples.
 
-Depth: write 4 to 8 sections, as many as the topic needs. Each explanation \
-should be about 3 to 5 \
-sentences, and each section needs a specific, named example. Define every \
+Depth: write as many sections as the topic's required content needs, and no \
+more. Never add filler, padding or speculative sections. Each explanation \
+should be about 3 to 5 sentences and must STATE its ideas explicitly in plain \
+sentences; naming a step or a term is not teaching it. Each section needs a \
+specific, named example. Define every \
 technical term, acronym and specialized word (even common-sounding ones such \
 as "database") in plain words at or before its first use. Make sure every \
 learning objective is taught by a section and every key takeaway is supported \
@@ -72,23 +75,32 @@ exactly, with no extra fields.\
 """.replace("{rubric}", rubric_text()).replace("{guardrails}", guardrails_text())
 
 
-def build_prompt(topic: str, requirements: TopicRequirements | None = None) -> str:
-    """Build the user prompt: the topic, mandatory concepts and the JSON schema."""
-    schema = json.dumps(LessonContent.model_json_schema(), indent=2)
-    concepts = (
-        "You MUST teach every one of these mandatory concepts at beginner level, "
-        "each clearly and by name, using as many sections as needed (at most 8):\n"
-        f"{concepts_text(requirements)}\n\n"
+def _requirements_block(requirements: TopicRequirements) -> str:
+    return (
+        "You MUST teach every concept below, and you MUST state every teaching "
+        "point in an explicit sentence of its own, at beginner level. Use one "
+        "section per concept, or combine closely related concepts in one section; "
+        "do not add sections that teach nothing new:\n"
+        f"{concepts_text(requirements, with_ids=False)}\n\n"
+        "Teach this workflow as numbered steps, and explain how each step leads to "
+        "the next (how retrieval, augmentation and generation connect):\n"
+        f"{workflow_text(requirements)}\n\n"
+        f"{requirements.worked_example} Put it in the example field of the section "
+        "that teaches the end-to-end workflow.\n\n"
         "Topic-specific accuracy rules:\n"
         f"{guardrails_text(requirements)}\n\n"
-        if requirements
-        else ""
     )
+
+
+def build_prompt(topic: str, requirements: TopicRequirements | None = None) -> str:
+    """Build the user prompt: the topic, the curriculum and the JSON schema."""
+    schema = json.dumps(LessonContent.model_json_schema(), indent=2)
+    curriculum = _requirements_block(requirements) if requirements else ""
     return (
-        f"Write a complete beginner-friendly lesson on: {topic}\n\n{concepts}"
+        f"Write a complete beginner-friendly lesson on: {topic}\n\n{curriculum}"
         "Set learner_level to describe a beginner with no technical background. "
-        "Include at least 2 learning objectives, 4 to 8 sections (each with a "
-        "heading, explanation and example) and at least 3 key takeaways.\n\n"
+        "Include at least 2 learning objectives, one heading, explanation and "
+        "example per section, and at least 3 key takeaways.\n\n"
         f"JSON schema to follow:\n{schema}"
     )
 

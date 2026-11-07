@@ -21,8 +21,16 @@ class RejectionRecord(TypedDict):
     improvement_feedback: str
     another_attempt_made: bool
     changes: list[str]  # what the improver changed in response (filled in later)
-    missing_concepts: list[str]  # ids of mandatory concepts not taught
+    missing_concepts: list[str]  # ids of concepts not taught at all
+    weak_concepts: list[str]  # ids of concepts only partly taught
     problem_sentences: list[str]  # exact lesson text the evaluator flagged
+    # What happened after this failure. Empty ``changes`` is NOT a failed
+    # improvement: the final entry never has one, because no improvement
+    # follows it. ``change_summary`` always says which case applies.
+    change_summary: str
+    improvement_unaddressed: list[str]  # points the revision did not state
+    concepts_resolved_next: list[str]  # fixed per the next evaluation
+    concepts_open_next: list[str]  # still open per the next evaluation
 
 
 class ErrorInfo(TypedDict):
@@ -50,6 +58,7 @@ class WorkflowState(TypedDict):
     best_evaluation_number: int  # which evaluation produced it (0 = none yet)
     latest_lesson: dict[str, Any] | None  # set when a rejected run returns
     latest_evaluation: dict[str, Any] | None  # an earlier, better version
+    rejection_reason: str  # why the run was rejected (empty otherwise)
 
 
 def initial_state(topic: str, maximum_attempts: int) -> WorkflowState:
@@ -69,4 +78,5 @@ def initial_state(topic: str, maximum_attempts: int) -> WorkflowState:
         best_evaluation_number=0,
         latest_lesson=None,
         latest_evaluation=None,
+        rejection_reason="",
     )

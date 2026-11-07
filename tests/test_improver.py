@@ -204,21 +204,22 @@ def test_instructions_require_sweep_and_scope_control():
     assert "do not change learning_objectives" in text
 
 
-def test_prompt_includes_mandatory_concepts_when_given(mock_llm):
+def test_prompt_includes_the_curriculum_when_given(mock_llm):
     from app.evaluation.topics import RAG_REQUIREMENTS
 
     asyncio.run(
         improve_lesson(make_lesson(), make_evaluation(), requirements=RAG_REQUIREMENTS)
     )
     prompt = mock_llm.await_args.args[0]
-    assert "Mandatory concepts the finished lesson must teach" in prompt
+    assert "must state every teaching point of this curriculum" in prompt
     assert "[augmentation]" in prompt
-    assert "do not rewrite sections that already teach theirs" in prompt
+    assert "keep sections that already do; do not rewrite them" in prompt
+    assert "1. The user asks a question." in prompt
 
 
 def test_prompt_has_no_concept_block_without_requirements(mock_llm):
     run()
-    assert "Mandatory concepts" not in mock_llm.await_args.args[0]
+    assert "curriculum" not in mock_llm.await_args.args[0]
 
 
 # --- Phase 2: accuracy guardrails --------------------------------------------------
@@ -417,7 +418,7 @@ def test_improver_logs_responses_and_reasks(mock_llm, events):
     names = [name for name, _ in events]
     assert names == [
         "improver_response",
-        "improver_preservation_problems",
+        "improver_problems",
         "improver_reask",
         "improver_response",
     ]

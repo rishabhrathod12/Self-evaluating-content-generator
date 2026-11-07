@@ -6,10 +6,8 @@ import pytest
 from app.agents import evaluator
 from app.agents.evaluator import (
     EvaluationValidationError,
-    EvidenceError,
     InvalidEvaluationJSONError,
     body_text,
-    collect_evidence_problems,
     evaluate_lesson,
     find_definition,
     render_lesson,
@@ -369,13 +367,21 @@ def test_jargon_issue_needs_term_and_quote(mock_llm):
         run(None)
 
 
-def test_invented_quote_is_rejected(mock_llm):
+def test_an_invented_evidence_quote_is_never_evidence_and_never_an_error(mock_llm):
+    from app.agents.evaluator import _normalize
+
     data = make_result()
     data["checks"][0]["evidence_quote"] = "This sentence is not in the lesson."
     mock_llm.return_value = json.dumps(data)
-    with pytest.raises(EvidenceError, match="does not appear"):
-        run(None)
-    assert mock_llm.await_count == 2  # asked again once, then gave up
+
+    result = run(None)
+
+    assert mock_llm.await_count == 1  # no re-ask, no error
+    quote = result.checks[0].evidence_quote
+    assert quote != "This sentence is not in the lesson."
+    assert _normalize(quote) in _normalize(render_lesson(make_lesson()))  # real text
+    assert any("not in the lesson" in n for n in result.notes)
+    assert result.overall_pass is True  # the verdict is the evaluator's judgement
 
 
 def test_quote_matching_ignores_case_whitespace_curly_quotes_and_ellipsis(mock_llm):
@@ -385,19 +391,21 @@ def test_quote_matching_ignores_case_whitespace_curly_quotes_and_ellipsis(mock_l
     assert run(None).overall_pass is True
 
 
-def test_invalid_evaluation_is_re_asked_once_then_accepted(mock_llm):
-    bad = make_result()
-    bad["checks"][0]["evidence_quote"] = "Made up text."
-    mock_llm.side_effect = [json.dumps(bad), json.dumps(make_result())]
+def test_a_malformed_response_is_retried_once_then_accepted(mock_llm):
+    mock_llm.side_effect = ["this is not json", json.dumps(make_result())]
     result = run(None)
     assert result.overall_pass is True
     assert mock_llm.await_count == 2
     second_prompt = mock_llm.await_args_list[1].args[0]
-    assert "Your previous evaluation was rejected" in second_prompt
-    assert "Made up text." in second_prompt
+    assert "It was rejected for these specific problems" in second_prompt
+    assert "not valid JSON" in second_prompt
+    # The previous response is carried along so unrelated verdicts stay put.
+    assert "Your previous response was" in second_prompt
+    assert "this is not json" in second_prompt
+    assert "Change ONLY what these problems require" in second_prompt
 
 
-def test_claim_contradicted_by_lesson_is_rejected_then_corrected(monkeypatch):
+def test_claim_contradicted_by_lesson_is_resolved_without_a_reask(monkeypatch):
     section = {
         "heading": "H",
         "explanation": (
@@ -413,13 +421,14 @@ def test_claim_contradicted_by_lesson_is_rejected_then_corrected(monkeypatch):
         }
     )
     bad = jargon_failure("database", "often called a 'database.'")
-    mock = AsyncMock(side_effect=[json.dumps(bad), json.dumps(make_result())])
+    mock = AsyncMock(return_value=json.dumps(bad))
     monkeypatch.setattr(evaluator, "generate_text", mock)
 
     result = asyncio.run(evaluate_lesson(lesson))
 
+    assert mock.await_count == 1  # a re-ask destabilizes verdicts: none is sent
     assert result.overall_pass is True
-    assert "defines it" in mock.await_args_list[1].args[0]
+    assert any("database" in n for n in result.notes)
 
 
 def test_persistent_contradiction_is_resolved_in_code(monkeypatch):
@@ -437,7 +446,7 @@ def test_persistent_contradiction_is_resolved_in_code(monkeypatch):
 
     result = asyncio.run(evaluate_lesson(lesson))
 
-    assert mock.await_count == 2  # one re-ask, then resolved in code
+    assert mock.await_count == 1  # resolved in code, no re-ask
     assert result.overall_pass is True
     assert result.checks[3].passed is True
     assert result.notes
@@ -523,40 +532,43 @@ def test_quote_edge_punctuation_is_tolerated(monkeypatch, quote):
         "RAG helps computers to look for information, like searching in a library.",
     ],
 )
-def test_changed_words_or_inner_punctuation_still_rejected(monkeypatch, quote):
+def test_changed_words_are_never_evidence_but_do_not_end_the_run(monkeypatch, quote):
     data = make_result()
     data["checks"][1]["evidence_quote"] = quote
-    monkeypatch.setattr(
-        evaluator, "generate_text", AsyncMock(return_value=json.dumps(data))
+    mock = AsyncMock(return_value=json.dumps(data))
+    monkeypatch.setattr(evaluator, "generate_text", mock)
+    result = asyncio.run(evaluate_lesson(_lesson_with_sentence(SENTENCE)))
+    assert mock.await_count == 1
+    assert result.checks[1].evidence_quote != quote
+    assert "searching in a library" in result.checks[1].evidence_quote  # real text
+    assert any(
+        "not in the lesson" in n or "corrected to the exact" in n for n in result.notes
     )
-    with pytest.raises(EvidenceError, match="does not appear"):
-        asyncio.run(evaluate_lesson(_lesson_with_sentence(SENTENCE)))
 
 
-def test_error_and_retry_prompt_show_closest_real_sentence(monkeypatch):
+def test_a_dissimilar_quote_is_replaced_by_the_closest_real_sentence(monkeypatch):
     data = make_result()
     data["checks"][1]["evidence_quote"] = (
         "RAG helps a computer find stuff in a library."
     )
-    mock = AsyncMock(return_value=json.dumps(data))
-    monkeypatch.setattr(evaluator, "generate_text", mock)
-    with pytest.raises(EvidenceError) as info:
-        asyncio.run(evaluate_lesson(_lesson_with_sentence(SENTENCE)))
-    assert "Closest text in the lesson" in str(info.value)
-    assert "like searching in a library" in str(info.value)
-    assert "Closest text in the lesson" in mock.await_args_list[1].args[0]
+    monkeypatch.setattr(
+        evaluator, "generate_text", AsyncMock(return_value=json.dumps(data))
+    )
+    result = asyncio.run(evaluate_lesson(_lesson_with_sentence(SENTENCE)))
+    assert "like searching in a library" in result.checks[1].evidence_quote
 
 
-def test_repeated_problems_are_deduplicated(mock_llm):
+def test_an_unverifiable_issue_quote_in_other_criteria_keeps_the_claim(mock_llm):
     data = make_result(failing=(1,))
     data["checks"][1]["issues"] = [
-        {"problem": "p", "quote": "Not in lesson", "term": ""},
-        {"problem": "q", "quote": "Not in lesson", "term": ""},
+        {"problem": "p", "quote": "Not in lesson", "term": "", "correction": ""}
     ]
     mock_llm.return_value = json.dumps(data)
-    with pytest.raises(EvidenceError) as info:
-        run(None)
-    assert str(info.value).count("Not in lesson") == 1
+    result = run(None)
+    issue = result.checks[1].issues[0]
+    assert result.checks[1].passed is False  # the judgement is kept
+    assert issue.quote == ""  # but the unverifiable quote is not
+    assert any("kept without the quote" in n for n in result.notes)
 
 
 # --- Acronym definitions, deterministic resolution, notes -------------------------
@@ -678,8 +690,6 @@ def test_definition_only_in_topic_label_does_not_count():
         "Machines look things up.", topic_line="RAG (Retrieval-Augmented Generation)"
     )
     result = result_with_issues([issue("RAG", "Machines look things up.")])
-    _, contradicted = collect_evidence_problems(result, lesson)
-    assert contradicted == []
     assert resolve_contradictions(result, lesson) == result
 
 
@@ -762,38 +772,32 @@ def test_resolve_does_not_treat_a_bare_mention_as_a_definition():
     assert resolve_contradictions(result, lesson) is result
 
 
-def test_retry_prompt_has_original_sentence_and_removal_instruction(monkeypatch):
-    lesson = lesson_with(RAG_BODY)
-    bad = result_with_issues([issue("RAG")]).model_dump()
-    mock = AsyncMock(return_value=json.dumps(bad))
-    monkeypatch.setattr(evaluator, "generate_text", mock)
-
-    asyncio.run(evaluate_lesson(lesson))
-
-    retry_prompt = mock.await_args_list[1].args[0]
-    assert '"RAG stands for Retrieval-Augmented Generation."' in retry_prompt
-    assert "Remove this issue" in retry_prompt
-    assert "mark that check as passed" in retry_prompt
-
-
-def test_second_attempt_with_invalid_quote_and_contradiction_still_raises(monkeypatch):
+def test_invented_evidence_and_a_provable_contradiction_are_both_handled(monkeypatch):
     lesson = lesson_with(RAG_BODY)
     data = result_with_issues([issue("RAG")]).model_dump()
     data["checks"][0]["evidence_quote"] = "Invented sentence."
     mock = AsyncMock(return_value=json.dumps(data))
     monkeypatch.setattr(evaluator, "generate_text", mock)
-    with pytest.raises(EvidenceError, match="does not appear"):
-        asyncio.run(evaluate_lesson(lesson))
+    result = asyncio.run(evaluate_lesson(lesson))
+    assert mock.await_count == 1
+    assert result.overall_pass is True
+    assert any("Resolved unexplained-term issue 'RAG'" in n for n in result.notes)
+    assert any("not in the lesson" in n for n in result.notes)
 
 
-def test_invented_quote_in_a_resolvable_issue_is_not_resolved(monkeypatch):
+def test_a_jargon_issue_with_an_invented_quote_is_dropped_as_unverifiable(
+    monkeypatch,
+):
     lesson = lesson_with(RAG_BODY)
     data = result_with_issues([issue("RAG", "Made up quote")]).model_dump()
     monkeypatch.setattr(
         evaluator, "generate_text", AsyncMock(return_value=json.dumps(data))
     )
-    with pytest.raises(EvidenceError, match="does not appear"):
-        asyncio.run(evaluate_lesson(lesson))
+    result = asyncio.run(evaluate_lesson(lesson))
+    assert result.checks[3].passed is True
+    notes = " ".join(result.notes)
+    assert "dropped an issue whose quote is not in the lesson" in notes
+    assert "Resolved unexplained-term issue" not in notes  # it was never verified
 
 
 def test_resolution_through_evaluate_lesson_records_notes(monkeypatch):
@@ -830,169 +834,6 @@ def test_rubric_says_labels_are_not_first_use():
     assert "lesson body" in text
 
 
-# --- Phase 1: mandatory concepts ---------------------------------------------------
-
-from app.agents.evaluator import apply_concept_gaps  # noqa: E402
-from app.evaluation.schemas import ConceptCheck  # noqa: E402
-from app.evaluation.topics import RAG_REQUIREMENTS  # noqa: E402
-
-RAG_SENTENCES = (
-    "Retrieval-Augmented Generation (RAG) lets a language model (LLM) use recent "
-    "and private documents. A language model is an AI system that writes text, and "
-    "it can make up answers. First, retrieval finds documents in a knowledge "
-    "collection. Then the context is given to the model, which writes the answer. "
-    "RAG does not guarantee accuracy because documents can be incomplete or "
-    "outdated. Step by step, that is the whole process."
-)
-EVIDENCE = "A language model is an AI system that writes text"
-
-
-def concept_entries(uncovered: tuple[str, ...] = ()) -> list[dict]:
-    return [
-        {
-            "concept_id": c.id,
-            "covered": c.id not in uncovered,
-            "evidence_quote": "" if c.id in uncovered else EVIDENCE,
-            "missing_detail": "Not taught at all." if c.id in uncovered else "",
-        }
-        for c in RAG_REQUIREMENTS.concepts
-    ]
-
-
-def rag_result(uncovered=(), failing=(), body=RAG_SENTENCES) -> tuple:
-    data = make_result(failing=failing)
-    data["concept_checks"] = concept_entries(uncovered)
-    return data, lesson_with(body)
-
-
-def run_with_concepts(monkeypatch, data, lesson):
-    mock = AsyncMock(return_value=json.dumps(data))
-    monkeypatch.setattr(evaluator, "generate_text", mock)
-    result = asyncio.run(evaluate_lesson(lesson, requirements=RAG_REQUIREMENTS))
-    return result, mock
-
-
-def test_all_concepts_covered_leaves_verdict_untouched(monkeypatch):
-    data, lesson = rag_result()
-    result, mock = run_with_concepts(monkeypatch, data, lesson)
-    assert result.overall_pass is True
-    assert result.notes == []
-    assert len(result.concept_checks) == 8
-    assert mock.await_count == 1
-
-
-def test_missing_concept_forces_completeness_to_fail(monkeypatch):
-    data, lesson = rag_result(uncovered=("augmentation",))
-    result, _ = run_with_concepts(monkeypatch, data, lesson)
-
-    completeness = result.checks[6]
-    assert completeness.passed is False
-    assert "Augmentation" in completeness.reason
-    assert "Providing the retrieved information as context" in (
-        completeness.improvement_suggestion
-    )
-    assert any("Augmentation" in i.problem for i in completeness.issues)
-    assert result.overall_pass is False
-    assert any(CRITERIA[6] in r for r in result.failure_reasons)
-    assert "Augmentation" in result.improvement_feedback
-    assert any("marked failed by code" in n for n in result.notes)
-    assert all(c.passed for i, c in enumerate(result.checks) if i != 6)
-
-
-def test_missing_concept_extends_an_existing_completeness_failure(monkeypatch):
-    data, lesson = rag_result(uncovered=("limitations",), failing=(6,))
-    result, _ = run_with_concepts(monkeypatch, data, lesson)
-    completeness = result.checks[6]
-    assert completeness.passed is False
-    assert len(completeness.issues) == 2  # the model's issue + the missing concept
-    assert "Because." in completeness.reason
-    assert "Limitations" in completeness.reason
-    assert completeness.improvement_suggestion.startswith("Fix it.")
-    assert "Limitations" in completeness.improvement_suggestion
-
-
-def test_several_missing_concepts_are_all_named(monkeypatch):
-    data, lesson = rag_result(uncovered=("why_needed", "language_model"))
-    result, _ = run_with_concepts(monkeypatch, data, lesson)
-    problems = " ".join(i.problem for i in result.checks[6].issues)
-    assert "Why RAG is needed" in problems
-    assert "language model (LLM)" in problems
-
-
-def test_evaluator_marked_missing_but_signal_present_is_still_failed(monkeypatch):
-    data, lesson = rag_result(uncovered=("language_model",))
-    result, _ = run_with_concepts(monkeypatch, data, lesson)
-    assert result.checks[6].passed is False  # the evaluator's word is not overridden
-
-
-def test_wrong_concept_ids_are_re_asked_then_rejected(monkeypatch):
-    data, lesson = rag_result()
-    data["concept_checks"].pop()
-    mock = AsyncMock(return_value=json.dumps(data))
-    monkeypatch.setattr(evaluator, "generate_text", mock)
-    with pytest.raises(EvidenceError, match="concept ids"):
-        asyncio.run(evaluate_lesson(lesson, requirements=RAG_REQUIREMENTS))
-    assert mock.await_count == 2
-
-
-def test_duplicate_concept_id_rejected(monkeypatch):
-    data, lesson = rag_result()
-    data["concept_checks"][1] = dict(data["concept_checks"][0])
-    monkeypatch.setattr(
-        evaluator, "generate_text", AsyncMock(return_value=json.dumps(data))
-    )
-    with pytest.raises(EvidenceError, match="concept ids"):
-        asyncio.run(evaluate_lesson(lesson, requirements=RAG_REQUIREMENTS))
-
-
-def test_invented_concept_evidence_quote_rejected(monkeypatch):
-    data, lesson = rag_result()
-    data["concept_checks"][0]["evidence_quote"] = "A sentence nobody wrote."
-    monkeypatch.setattr(
-        evaluator, "generate_text", AsyncMock(return_value=json.dumps(data))
-    )
-    with pytest.raises(EvidenceError, match="concept 'definition'"):
-        asyncio.run(evaluate_lesson(lesson, requirements=RAG_REQUIREMENTS))
-
-
-def test_concept_checks_must_be_empty_without_requirements(mock_llm):
-    data = make_result()
-    data["concept_checks"] = concept_entries()
-    mock_llm.return_value = json.dumps(data)
-    with pytest.raises(EvidenceError, match="empty list"):
-        run(None)
-
-
-def test_prompt_lists_concepts_or_says_none_apply():
-    with_req = evaluator.build_prompt(make_lesson(), RAG_REQUIREMENTS)
-    assert "Mandatory concepts" in with_req
-    assert "[language_model]" in with_req
-    assert "public internet" in with_req
-    without = evaluator.build_prompt(make_lesson())
-    assert "No mandatory concepts apply" in without
-
-
-def test_api_schema_requires_concept_checks():
-    schema = evaluator.api_schema()
-    assert "concept_checks" in schema["properties"]
-    assert "concept_checks" in schema["required"]
-
-
-def test_apply_concept_gaps_without_requirements_is_a_no_op():
-    data = make_result()
-    result = EvaluationResult.model_validate(data)
-    assert apply_concept_gaps(result, None) is result
-
-
-def test_concept_check_validators():
-    with pytest.raises(ValueError, match="needs a quote"):
-        ConceptCheck(concept_id="x", covered=True)
-    with pytest.raises(ValueError, match="needs detail"):
-        ConceptCheck(concept_id="x", covered=False)
-    assert ConceptCheck(concept_id="x", covered=True, evidence_quote="q").covered
-    assert not ConceptCheck(concept_id="x", covered=False, missing_detail="d").covered
-
-
 # --- Phase 2: accuracy failures must name the claim and the correction ------------
 
 
@@ -1022,12 +863,15 @@ def test_accuracy_failure_without_quote_or_correction_rejected(
         run(None)
 
 
-def test_accuracy_quote_must_exist_in_the_lesson(mock_llm):
+def test_an_accuracy_issue_quoting_text_that_is_not_there_is_dropped(mock_llm):
     mock_llm.return_value = json.dumps(
         accuracy_failure("RAG guarantees correct answers.", "It does not.")
     )
-    with pytest.raises(EvidenceError, match="does not appear"):
-        run(None)
+    result = run(None)
+    assert result.checks[0].passed is True
+    assert any(
+        "dropped an issue whose quote is not in the lesson" in n for n in result.notes
+    )
 
 
 def test_non_accuracy_failures_do_not_need_a_correction(mock_llm):
@@ -1096,20 +940,18 @@ def test_response_is_logged_for_every_attempt(mock_llm, events):
     assert "overall_pass" in events[0][1]["raw"]
 
 
-def test_reask_and_evidence_problems_are_logged(mock_llm, events):
-    bad = make_result()
-    bad["checks"][0]["evidence_quote"] = "Made up text."
-    mock_llm.side_effect = [json.dumps(bad), json.dumps(make_result())]
+def test_reask_and_validation_failures_are_logged(mock_llm, events):
+    mock_llm.side_effect = ["not json", json.dumps(make_result())]
     run(None)
     names = [name for name, _ in events]
     assert names == [
         "evaluator_response",
-        "evaluator_evidence_problems",
+        "evaluator_validation_failure",
         "evaluator_reask",
         "evaluator_response",
     ]
-    assert "Made up text." in events[1][1]["invalid"][0]
-    assert "Made up text." in events[2][1]["feedback"]
+    assert events[1][1]["error_type"] == "InvalidEvaluationJSONError"
+    assert "not valid JSON" in events[2][1]["feedback"]
 
 
 def test_validation_failures_are_logged(mock_llm, events):
@@ -1135,207 +977,165 @@ def test_resolution_notes_are_logged(monkeypatch, events):
     assert any("Resolved unexplained-term issue" in n for n in notes[0]["notes"])
 
 
-# --- Fix 2: hints support the verdict; a missing hint asks for confirmation --------
-
-from app.agents.evaluator import find_unconfirmed_concepts  # noqa: E402
-
-DIFFERENT_WORDING = (
-    "RAG (Retrieval-Augmented Generation) is a way to help an AI answer questions. "
-    "An AI chat program only knows what it studied in the past, so it cannot know "
-    "about last week's news or your own company files, and it may guess wrongly. "
-    "A large AI text program, the kind that composes sentences, is the answering "
-    "part. Before it answers, a search step looks through a library of saved "
-    "articles and picks the most useful passages. Those passages are pasted into "
-    "the question so the AI can see them. After that, the AI composes a reply "
-    "using what it was shown. Step 1 is the search, step 2 is the pasting, step 3 "
-    "is the reply. The search can miss things, and the saved articles can be "
-    "stale, so answers might still be unreliable."
-)
-SEMANTIC_QUOTE = (
-    "A large AI text program, the kind that composes sentences, is the answering part"
-)
-FILLER = "First we begin. Then we continue. Next we go on. This has context and write."
-
-
-def covered_result(quote: str, uncovered: tuple[str, ...] = ()) -> dict:
-    data = make_result()
-    data["concept_checks"] = [
-        {
-            "concept_id": c.id,
-            "covered": c.id not in uncovered,
-            "evidence_quote": "" if c.id in uncovered else quote,
-            "missing_detail": "Not taught." if c.id in uncovered else "",
-        }
-        for c in RAG_REQUIREMENTS.concepts
-    ]
-    return data
-
-
-def evaluate_sequence(monkeypatch, lesson, *responses):
-    mock = AsyncMock(side_effect=[json.dumps(r) for r in responses])
-    monkeypatch.setattr(evaluator, "generate_text", mock)
-    result = asyncio.run(evaluate_lesson(lesson, requirements=RAG_REQUIREMENTS))
-    return result, mock
-
-
-def test_correct_wording_without_hints_is_not_failed_outright():
-    lesson = lesson_with(DIFFERENT_WORDING)
-    unconfirmed = find_unconfirmed_concepts(
-        EvaluationResult.model_validate(covered_result(SEMANTIC_QUOTE)),
-        lesson,
-        RAG_REQUIREMENTS,
-    )
-    assert [c.id for c in unconfirmed] == ["language_model"]
-
-
-def test_unconfirmed_concept_triggers_one_confirmation_then_is_accepted(monkeypatch):
-    lesson = lesson_with(DIFFERENT_WORDING)
-    response = covered_result(SEMANTIC_QUOTE)
-    result, mock = evaluate_sequence(monkeypatch, lesson, response, response)
-
-    assert mock.await_count == 2
-    assert result.overall_pass is True
-    assert all(c.covered for c in result.concept_checks)
-    assert any(
-        "What a language model (LLM) is" in n and "hints did not confirm" in n
-        for n in result.notes
-    )
-    retry = mock.await_args_list[1].args[0]
-    assert "mandatory concept 'What a language model (LLM) is'" in retry
-    assert "Re-check it" in retry
-    assert "expected wording" not in retry
-    assert "hint" not in retry.lower().replace("hints", "")
-
-
-def test_confirmation_can_flip_the_concept_to_missing(monkeypatch):
-    lesson = lesson_with(DIFFERENT_WORDING)
-    first = covered_result(SEMANTIC_QUOTE)
-    second = covered_result(SEMANTIC_QUOTE, uncovered=("language_model",))
-    result, mock = evaluate_sequence(monkeypatch, lesson, first, second)
-
-    assert mock.await_count == 2
-    assert result.overall_pass is False
-    assert result.checks[6].passed is False
-    entry = next(c for c in result.concept_checks if c.concept_id == "language_model")
-    assert entry.covered is False
-    assert "What a language model (LLM) is" in result.checks[6].reason
-
-
-def test_invalid_quote_still_uses_the_validation_path(monkeypatch):
-    lesson = lesson_with(DIFFERENT_WORDING)
-    bad = covered_result("A sentence that is not in the lesson")
-    mock = AsyncMock(return_value=json.dumps(bad))
-    monkeypatch.setattr(evaluator, "generate_text", mock)
-    with pytest.raises(EvidenceError, match="does not appear"):
-        asyncio.run(evaluate_lesson(lesson, requirements=RAG_REQUIREMENTS))
-    assert mock.await_count == 2
-
-
-def test_hints_present_means_no_confirmation_question(monkeypatch):
-    data, lesson = rag_result()
-    result, mock = evaluate_sequence(monkeypatch, lesson, data)
-    assert mock.await_count == 1
-    assert result.notes == []
-
-
-def test_filler_with_generic_words_is_unconfirmed_for_every_concept():
-    lesson = lesson_with(FILLER)
-    result = EvaluationResult.model_validate(covered_result("First we begin"))
-    unconfirmed = find_unconfirmed_concepts(result, lesson, RAG_REQUIREMENTS)
-    assert [c.id for c in unconfirmed] == [c.id for c in RAG_REQUIREMENTS.concepts]
-
-
-def test_filler_is_questioned_and_every_acceptance_is_noted(monkeypatch):
-    lesson = lesson_with(FILLER)
-    response = covered_result("First we begin")
-    result, mock = evaluate_sequence(monkeypatch, lesson, response, response)
-    assert mock.await_count == 2  # generic words never count as proof
-    assert sum("hints did not confirm" in n for n in result.notes) == 8
-
-
-def test_hint_in_a_different_section_does_not_confirm_the_quoted_one():
-    plain = {
-        "heading": "A",
-        "explanation": "A big AI program writes text.",
-        "example": "X",
-    }
-    other = {
-        "heading": "B",
-        "explanation": "A language model is mentioned here.",
-        "example": "X",
-    }
-    base = make_lesson().model_dump()
-    lesson = LessonContent.model_validate({**base, "sections": [plain, other, other]})
-
-    result = EvaluationResult.model_validate(
-        covered_result("A big AI program writes text")
-    )
-    unconfirmed = [
-        c.id for c in find_unconfirmed_concepts(result, lesson, RAG_REQUIREMENTS)
-    ]
-    assert "language_model" in unconfirmed
-
-    result = EvaluationResult.model_validate(
-        covered_result("A language model is mentioned here")
-    )
-    unconfirmed = [
-        c.id for c in find_unconfirmed_concepts(result, lesson, RAG_REQUIREMENTS)
-    ]
-    assert "language_model" not in unconfirmed
-
-
-def test_substring_collisions_do_not_confirm_a_concept():
-    body = "A willmore bullmarket story. It was authentic, firsthand and inventive."
-    lesson = lesson_with(body)
-    result = EvaluationResult.model_validate(
-        covered_result("A willmore bullmarket story")
-    )
-    ids = [c.id for c in find_unconfirmed_concepts(result, lesson, RAG_REQUIREMENTS)]
-    assert "language_model" in ids
-    assert "why_needed" in ids
-
-
-def test_no_confirmation_without_requirements():
-    result = EvaluationResult.model_validate(make_result())
-    assert find_unconfirmed_concepts(result, make_lesson(), None) == []
-
-
-def test_missing_concept_still_fails_completeness_even_if_hints_are_present(
-    monkeypatch,
-):
-    data, lesson = rag_result(uncovered=("language_model",))
-    result, _ = run_with_concepts(monkeypatch, data, lesson)
-    assert result.checks[6].passed is False
-    assert not any("hints did not confirm" in n for n in result.notes)
-
-
-def test_generator_prompt_does_not_list_hint_keywords():
-    from app.agents.generator import build_prompt
-    from app.evaluation.topics import RAG_REQUIREMENTS as REQ
-
-    prompt = build_prompt("Introduction to RAG", REQ).lower()
-    for hint in ("pasted into", "handed over", "knowledge base", "searches through"):
-        assert hint not in prompt
-    for word in ("keyword", "signal terms", "expected wording"):
-        assert word not in prompt
-
-
 def test_logged_events_never_contain_prompts(mock_llm, events):
-    bad = make_result()
-    bad["checks"][0]["evidence_quote"] = "Made up text."
-    mock_llm.side_effect = [json.dumps(bad), json.dumps(make_result())]
+    mock_llm.side_effect = ["not json", json.dumps(make_result())]
     run(None)
-    allowed = {
-        "attempt",
-        "raw",
-        "feedback",
-        "invalid",
-        "contradicted",
-        "unconfirmed_concepts",
-        "error_type",
-        "message",
-        "notes",
-    }
+    allowed = {"attempt", "raw", "feedback", "error_type", "message", "notes"}
     for _, fields in events:
         assert set(fields) <= allowed
         assert "Evaluate the following lesson" not in json.dumps(fields)
+
+
+# --- Final cycle: snapping quotes, negation and acronym recognisers -----------------
+
+from app.agents.evaluator import (  # noqa: E402
+    quote_negates_claim,
+    sanitize_quotes,
+    snap_quote,
+)
+from app.evaluation.schemas import EvaluationIssue  # noqa: E402
+
+SNAP_TEXT = (
+    "It helps to create more accurate responses by using real-time information. "
+    "A language model (often shortened to LLM) is an AI system."
+)
+
+
+def test_a_tidied_quote_snaps_to_the_exact_sentence():
+    quote = (
+        "RAG helps to create more accurate responses by using real-time information."
+    )
+    assert snap_quote(quote, SNAP_TEXT) == (
+        "It helps to create more accurate responses by using real-time information."
+    )
+
+
+def test_a_quote_that_starts_a_longer_sentence_snaps_to_it():
+    text = "Retrieval finds the most relevant documents for the question asked."
+    assert snap_quote("Retrieval finds the most relevant documents", text) == text
+
+
+@pytest.mark.parametrize(
+    "quote", ["The moon is made of cheese.", "RAG trains the model overnight.", ""]
+)
+def test_dissimilar_or_empty_quotes_do_not_snap(quote):
+    assert snap_quote(quote, SNAP_TEXT) is None
+
+
+def test_sanitize_corrects_a_near_verbatim_passed_evidence_quote():
+    lesson = _lesson_with_sentence("It helps to create more accurate responses.")
+    result = EvaluationResult.model_validate(make_result())
+    data = result.model_dump()
+    data["checks"][0]["evidence_quote"] = "RAG helps to create more accurate responses."
+    fixed = sanitize_quotes(EvaluationResult.model_validate(data), lesson)
+    assert fixed.checks[0].evidence_quote == (
+        "It helps to create more accurate responses."
+    )
+    assert any("corrected to the exact lesson sentence" in n for n in fixed.notes)
+
+
+def test_sanitize_leaves_a_result_with_real_quotes_untouched():
+    result = EvaluationResult.model_validate(make_result())
+    assert sanitize_quotes(result, make_lesson()) is result
+
+
+def test_sanitize_marks_a_check_passed_when_every_issue_was_unverifiable():
+    data = make_result(failing=(0,))
+    data["checks"][0]["issues"] = [
+        {
+            "problem": "p",
+            "quote": "Nothing like this appears anywhere",
+            "term": "",
+            "correction": "c",
+        }
+    ]
+    result = sanitize_quotes(EvaluationResult.model_validate(data), make_lesson())
+    assert result.checks[0].passed is True
+    assert any("none of its issues could be verified" in n for n in result.notes)
+    assert result.overall_pass is True
+
+
+@pytest.mark.parametrize(
+    ("quote", "problem", "reason", "expected"),
+    [
+        (
+            "RAG does not guarantee that every answer will be accurate.",
+            "Incorrect claim about guarantees.",
+            "The lesson claims that RAG can guarantee accuracy.",
+            True,
+        ),
+        (
+            "RAG cannot guarantee correct answers.",
+            "Claims a guarantee.",
+            "The lesson claims a guarantee.",
+            True,
+        ),
+        (  # a real overclaim: no negation
+            "RAG guarantees that every answer will be accurate.",
+            "Incorrect claim about guarantees.",
+            "The lesson claims that RAG can guarantee accuracy.",
+            False,
+        ),
+        (  # negation, but about something else
+            "RAG does not train the model, and it uses real-time information.",
+            "Claims real-time information.",
+            "The lesson claims real-time information.",
+            False,
+        ),
+        ("", "Claims a guarantee.", "Claims a guarantee.", False),
+    ],
+)
+def test_quote_negates_claim(quote, problem, reason, expected):
+    issue = EvaluationIssue(problem=problem, quote=quote, term="", correction="c")
+    assert quote_negates_claim(issue, reason) is expected
+
+
+def test_a_negated_sentence_flagged_as_a_guarantee_is_resolved_in_one_call(
+    monkeypatch,
+):
+    claim = "RAG does not guarantee that every answer will be accurate."
+    lesson = _lesson_with_sentence(claim)
+    data = make_result(failing=(0,))
+    data["checks"][0]["reason"] = "The lesson claims that RAG can guarantee accuracy."
+    data["checks"][0]["issues"] = [
+        {
+            "problem": "Incorrect claim about guarantees.",
+            "quote": claim,
+            "term": "",
+            "correction": "RAG does not guarantee accuracy; it may use outdated data.",
+        }
+    ]
+    mock = AsyncMock(return_value=json.dumps(data))
+    monkeypatch.setattr(evaluator, "generate_text", mock)
+    result = asyncio.run(evaluate_lesson(lesson))
+    assert mock.await_count == 1
+    assert result.checks[0].passed is True
+    assert any("already negates the claim" in n for n in result.notes)
+
+
+@pytest.mark.parametrize(
+    ("term", "text"),
+    [
+        ("LLM", "A language model (LLM) is an AI system."),
+        ("LLM", "A language model (often shortened to LLM) is an AI system."),
+        ("LLM", "A language model, also known as LLM, is an AI system."),
+        ("LLM", "Language models, abbreviated as LLM, write text."),
+        ("LLM", "A large language model (LLM) is an AI system."),
+        ("AI", "Artificial Intelligence (AI) is everywhere."),
+        ("language model", "A language model (LLM) is an AI system."),
+    ],
+)
+def test_acronym_introductions_are_recognised_as_definitions(term, text):
+    assert find_definition(term, text) is not None
+
+
+@pytest.mark.parametrize(
+    ("term", "text"),
+    [
+        ("LLM", "LLM is important."),
+        ("RAG", "A language model (LLM) is an AI system."),
+        ("LLM", "The cat (LLM) sat down."),
+    ],
+)
+def test_bare_mentions_and_unrelated_parentheses_are_not_definitions(term, text):
+    assert find_definition(term, text) is None

@@ -138,28 +138,56 @@ class EvaluationCheck(_StrictModel):
         return self
 
 
-class ConceptCheck(_StrictModel):
-    """Whether the lesson teaches one mandatory concept."""
+class PointCheck(_StrictModel):
+    """Whether the lesson explicitly states one teaching point.
 
-    concept_id: NonEmptyStr = Field(description="Id of the mandatory concept.")
-    covered: bool = Field(description="True if the lesson teaches this concept.")
+    The model only says ``covered`` and, when not, the ``gap``. Code finds the
+    evidence: ``evidence_quote`` is always a passage of the lesson located by code.
+    """
+
+    point_id: NonEmptyStr = Field(description="Id of the teaching point.")
+    covered: bool = Field(
+        description="True only if the lesson states the point explicitly in plain "
+        "words. Merely mentioning a term is not enough."
+    )
     evidence_quote: str = Field(
         default="",
-        description="Exact sentence copied from the lesson that teaches the concept. "
-        "Required when covered.",
+        description="Set by code: the lesson passage that states the point. Never "
+        "written by the model.",
     )
-    missing_detail: str = Field(
+    gap: str = Field(
         default="",
-        description="Exactly what is missing. Required when not covered.",
+        description="Exactly what the lesson must state but does not. Required "
+        "when not covered.",
     )
 
     @model_validator(mode="after")
-    def _evidence_or_detail(self) -> Self:
-        if self.covered and not self.evidence_quote.strip():
-            raise ValueError(f"Covered concept '{self.concept_id}' needs a quote.")
-        if not self.covered and not self.missing_detail.strip():
-            raise ValueError(f"Missing concept '{self.concept_id}' needs detail.")
+    def _gap_when_uncovered(self) -> Self:
+        if not self.covered and not self.gap.strip():
+            raise ValueError(f"Uncovered point '{self.point_id}' needs a gap.")
         return self
+
+
+ConceptStatus = Literal["covered", "weak", "missing"]
+
+
+class ConceptCheck(_StrictModel):
+    """A concept's status, derived by code from its point checks.
+
+    ``covered``: every point is explicitly stated. ``weak``: some are. ``missing``:
+    none are.
+    """
+
+    concept_id: NonEmptyStr
+    status: ConceptStatus
+    missing_points: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    evidence_quotes: list[str] = Field(default_factory=list)
+
+    @property
+    def covered(self) -> bool:
+        """True when every teaching point of the concept is stated."""
+        return self.status == "covered"
 
 
 class EvaluationResult(_StrictModel):
@@ -180,10 +208,14 @@ class EvaluationResult(_StrictModel):
         description="Combined actionable feedback for revising the lesson. "
         "Required when overall_pass is false, may be empty otherwise."
     )
+    point_checks: list[PointCheck] = Field(
+        default_factory=list,
+        description="One entry per teaching point listed in the prompt, or an "
+        "empty list when none are listed.",
+    )
     concept_checks: list[ConceptCheck] = Field(
         default_factory=list,
-        description="One entry per mandatory concept listed in the prompt, or an "
-        "empty list when none are listed.",
+        description="Set by code from point_checks, never by the model.",
     )
     notes: list[str] = Field(
         default_factory=list,
