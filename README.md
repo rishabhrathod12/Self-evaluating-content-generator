@@ -179,6 +179,23 @@ asyncio.run(main())
 The full result is saved to `outputs/run_result.json`. A run takes roughly 20 seconds
 per model call; a lesson that passes first time needs two calls (generate, evaluate).
 
+## Web UI (localhost)
+
+A small browser interface runs the same memory-enabled pipeline (`app.pipeline`).
+
+```powershell
+python -m uvicorn app.main:app --reload
+```
+
+Then open **http://127.0.0.1:8000** (same as http://localhost:8000), type a topic and
+click **Generate**. The page shows the lesson, the pass/rejected status and the
+evaluator's per-criterion checks, plus the raw JSON. Each run is saved to the memory
+database. Generation makes several model calls, so it can take a minute or more and
+uses your `.env` API key. Use `--port 8080` to change the port; press `Ctrl+C` to stop.
+
+API: `POST /api/generate` with `{"topic": "Introduction to RAG"}` returns the run
+state as JSON. Interactive docs are at http://127.0.0.1:8000/docs.
+
 ## Memory
 
 Finished runs (lessons, evaluations, rejection logs) are stored in a local SQLite
@@ -411,7 +428,8 @@ app/
   memory/              SQLite storage, retrieval, history context, prompt evolution
   pipeline.py          memory-enabled entry point (python -m app.pipeline)
   evolve.py            review prompt proposals (python -m app.evolve)
-  api/, main.py        placeholders (not implemented)
+  main.py, web/        local web UI (FastAPI + single HTML page)
+  api/                 placeholder (not implemented)
 tests/                 offline tests and real-run fixtures
 docs/architecture.md   design notes
 outputs/               run results and debug logs (git-ignored)
