@@ -10,7 +10,7 @@ The loop is bounded: each pass through ``improve`` consumes one of at most
 ``maximum_attempts`` (never more than 2) improvement attempts.
 """
 
-from typing import Literal
+from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
@@ -53,7 +53,9 @@ workflow = build_graph().compile()
 
 
 async def run_workflow(
-    topic: str, maximum_attempts: int | None = None
+    topic: str,
+    maximum_attempts: int | None = None,
+    memory_context: dict[str, Any] | None = None,
 ) -> WorkflowState:
     """Run the workflow for ``topic`` and return the final state.
 
@@ -64,8 +66,12 @@ async def run_workflow(
         topic: The lesson topic.
         maximum_attempts: Improvement attempts allowed (clamped to 0..2). Defaults
             to the ``MAX_RETRIES`` setting.
+        memory_context: Optional concise feedback from earlier runs (built by
+            ``app.memory.context.build_memory_context``). Without it, nothing changes.
     """
     if maximum_attempts is None:
         maximum_attempts = get_settings().max_retries
-    result = await workflow.ainvoke(initial_state(topic, maximum_attempts))
+    result = await workflow.ainvoke(
+        initial_state(topic, maximum_attempts, memory_context)
+    )
     return WorkflowState(**result)

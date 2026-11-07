@@ -31,6 +31,7 @@ from app.evaluation.topics import (
     workflow_text,
 )
 from app.llm import generate_text
+from app.memory.context import improver_memory_block
 
 
 class ImprovementError(Exception):
@@ -294,6 +295,7 @@ def build_prompt(
     evaluation: EvaluationResult,
     history: Sequence[Mapping[str, Any]] | None = None,
     requirements: TopicRequirements | None = None,
+    memory: Mapping[str, Any] | None = None,
 ) -> str:
     """Build the revision prompt from the lesson, the evaluation and past rounds."""
     failed = [c for c in evaluation.checks if not c.passed]
@@ -325,6 +327,7 @@ def build_prompt(
         f"Overall feedback:\n{evaluation.improvement_feedback}\n\n"
         f"{_needs_work_block(evaluation, requirements)}"
         f"{history_text}"
+        f"{improver_memory_block(memory)}"
         f"{_curriculum_block(requirements)}"
         f"Passing checkpoints (preserve these):\n{passed_text}\n\n"
         f"{scope}"
@@ -389,13 +392,15 @@ async def improve_lesson(
     evaluation: EvaluationResult,
     history: Sequence[Mapping[str, Any]] | None = None,
     requirements: TopicRequirements | None = None,
+    memory: Mapping[str, Any] | None = None,
 ) -> LessonContent:
     """Return an improved lesson based on ``evaluation``.
 
     ``history`` holds earlier failed rounds (rejection log entries), so the model
     knows what was already tried. If the evaluation passed, the original lesson is
     returned unchanged and the LLM is not called. The result is not re-evaluated
-    here.
+    here. ``memory`` is optional feedback from earlier stored runs of the topic; it
+    is advice that never overrides the current evaluation.
 
     A revision must change the lesson and keep untouched content. If a requested
     teaching point is still not stated after one re-ask, the revision is returned
@@ -417,7 +422,7 @@ async def improve_lesson(
             "Evaluation failed but contains no improvement feedback."
         )
     requested = requested_point_ids(evaluation)
-    base_prompt = build_prompt(lesson, evaluation, history, requirements)
+    base_prompt = build_prompt(lesson, evaluation, history, requirements, memory)
     prompt = base_prompt
     for attempt in (1, 2):
         raw = await generate_text(prompt, instructions=SYSTEM_INSTRUCTIONS)

@@ -134,7 +134,9 @@ def summarize_changes(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
 async def generate_node(state: WorkflowState) -> dict[str, Any]:
     """Generate the first lesson for the topic."""
     try:
-        lesson = await generate_lesson(state["topic"])
+        # The memory argument is only passed when there is history to use.
+        extra = {"memory": state["memory_context"]} if state["memory_context"] else {}
+        lesson = await generate_lesson(state["topic"], **extra)
     except AGENT_ERRORS as exc:
         return _error_update("generate", exc)
     return {"lesson": lesson.model_dump()}
@@ -236,6 +238,7 @@ async def improve_node(state: WorkflowState) -> dict[str, Any]:
     """Improve the lesson using the latest evaluation and log what changed."""
     lesson = LessonContent.model_validate(state["lesson"])
     evaluation = EvaluationResult.model_validate(state["evaluation"])
+    extra = {"memory": state["memory_context"]} if state["memory_context"] else {}
     try:
         # The last log entry is the current evaluation; the rest are earlier rounds.
         improved = await improve_lesson(
@@ -243,6 +246,7 @@ async def improve_node(state: WorkflowState) -> dict[str, Any]:
             evaluation,
             history=state["rejection_log"][:-1],
             requirements=get_requirements(state["topic"]),
+            **extra,
         )
     except AGENT_ERRORS as exc:
         return _error_update("improve", exc, state, current_evaluated=True)

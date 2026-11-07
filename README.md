@@ -14,10 +14,11 @@ specific feedback and evaluates it again. The assignment topic is
 | LangGraph workflow (generate, evaluate, improve, at most 2 improvements) | Implemented, tested |
 | Safe debug logging | Implemented, tested |
 | HTTP API (`app/main.py`, `app/api/`) | **Not implemented** (placeholder files) |
-| Persistent SQLite memory (`app/memory/`) | **Not implemented** (placeholder files) |
+| Persistent SQLite memory (`app/memory/`) | Implemented, tested (see [Memory](#memory)) |
 
 The workflow is run from Python (see [Running](#running)). Results are returned as a
-plain, JSON-serializable dictionary and are not stored in a database.
+plain, JSON-serializable dictionary. `app.pipeline` wraps it with SQLite memory (see
+[Memory](#memory)); `run_workflow` itself never touches the database.
 
 ## How it works
 
@@ -119,7 +120,7 @@ Copy-Item .env.example .env           # then edit .env
 | `MAX_RETRIES` | Improvement attempts, 0-2 (default `2`) |
 | `APP_ENV` | `development`, `testing` or `production` |
 | `DEBUG` | `true` writes model responses, re-asks and validation failures to `outputs/debug_log.jsonl` (default `false`) |
-| `DATABASE_URL` | Reserved for the unimplemented SQLite memory |
+| `DATABASE_URL` | SQLite memory location, `sqlite:///` URLs only (default `sqlite:///./lesson_memory.db`) |
 
 `.env` and everything under `outputs/` are git-ignored.
 
@@ -178,10 +179,119 @@ asyncio.run(main())
 The full result is saved to `outputs/run_result.json`. A run takes roughly 20 seconds
 per model call; a lesson that passes first time needs two calls (generate, evaluate).
 
+## Memory
+
+Finished runs (lessons, evaluations, rejection logs) are stored in a local SQLite
+database using only the standard library (`sqlite3`, no extra dependency), and later
+runs of the same topic use that history. The evaluator, the seven criteria and the
+retry limit (at most 2 improvements) are unchanged.
+
+### End-to-end flow
+
+Run the memory-enabled workflow (calls the OpenAI API, a few cents per run):
+
+```powershell
+.\.venv\Scripts\python.exe -m app.pipeline "Introduction to RAG"
+```
+
+`app.pipeline.run_with_memory(topic)` does three things in order:
+
+1. **Retrieve.** It reads the newest stored runs of the topic and builds a small
+   `memory_context` (`app/memory/context.py`): up to 6 short feedback lines (the
+   rejection reason of rejected runs and the evaluator feedback of failed drafts,
+   each clipped to about 350 characters, duplicates removed) plus an outline (title
+   and section headings only) of the latest lesson that passed.
+2. **Run.** It calls the unchanged LangGraph workflow with that context in the state.
+   The generator is told to avoid the earlier criticisms and may glance at the
+   outline for coverage and ordering, but is told not to copy any earlier lesson.
+   The improver gets the feedback lines as extra advice, explicitly subordinate to
+   the current evaluation. Lesson text is never passed on.
+3. **Save.** It saves the finished run, whether `passed`, `rejected` or `error`.
+
+With no history the context is empty and the agents are called, and prompted,
+exactly as before. Rerunning the same topic therefore sees the earlier runs.
+
+**Database errors.** If the memory cannot be opened or read, `MemoryDatabaseError`
+is raised before any model call, so nothing is spent. If only the final save fails,
+the finished run is not lost: `MemoryRunResult.save_error` holds the message and
+`run_id` is `None`. Credentials are scrubbed from error text before it is stored,
+and API keys are never part of the state.
+
+From Python:
+
+```python
+import asyncio
+from app.pipeline import run_with_memory
+
+result = asyncio.run(run_with_memory("Introduction to RAG"))
+print(
+    result.run_id, result.state["status"], result.memory_context.get("source_run_ids")
+)
+```
+
+### Storage layer
+
+**Setup.** None beyond `DATABASE_URL` (default `sqlite:///./lesson_memory.db`, a file in
+the project root; `sqlite:////absolute/path.db` for an absolute path). The file, its
+folder and the tables are created on first use, and opening an existing database is
+safe. `*.db` files are git-ignored.
+
+```python
+from app.memory import MemoryRepository
+
+memory = MemoryRepository.from_settings()  # or MemoryRepository("path/to.db")
+run_id = memory.save_run(
+    state
+)  # state from run_workflow(...); run_with_memory does this
+```
+
+**Schema** (`app/memory/database.py`, `PRAGMA user_version` = 1):
+
+| Table | Holds |
+| --- | --- |
+| `runs` | One row per run: topic, status (`passed`/`rejected`/`error`), UTC time, attempt counters, rejection reason, error |
+| `lessons` | The returned lesson (`role = 'returned'`) and the latest lesson (`'latest'`) as JSON |
+| `evaluations` | The evaluation of each stored lesson: overall result, passed checks, covered concepts/points, notes, full JSON |
+| `rejection_log` | One row per rejection record, in attempt order |
+
+`save_run` writes a run in a single transaction, so a failure stores nothing. Child
+rows cascade when a run is deleted.
+
+**Retrieval.**
+
+| Call | Returns |
+| --- | --- |
+| `get_run(run_id)` | A `StoredRun` (lessons, evaluations, rejection log) or `None` |
+| `list_runs(topic=None, status=None, limit=50)` | Stored runs, newest first |
+| `latest_passed_lesson(topic)` | The newest lesson that passed evaluation, as `LessonContent`, or `None` |
+| `evaluations_for_topic(topic, only_passed=False)` | Evaluation summaries, newest first |
+| `count_runs()`, `delete_run(run_id)` | Housekeeping |
+
+Topics are matched ignoring case and surrounding spaces. Rejected and error runs are
+stored for inspection but are never returned by `latest_passed_lesson`.
+
+**Limitations.**
+
+- Only what the final state holds is stored: the returned lesson with its own
+  evaluation, the latest lesson (if different), and the rejection log. Intermediate
+  versions that were neither best nor latest are not kept.
+- History is used only as advice: short feedback lines and one outline, picked by
+  recency, not by relevance scoring. A model may still ignore it, and it cannot make a
+  rejected topic pass. Nothing is deduplicated (each run adds a row), and failed
+  runs' feedback keeps being shown until newer runs push it out of the 5 newest.
+- Only `app.pipeline` / `run_with_memory` uses memory. Calling `run_workflow` directly
+  stores nothing and uses no history.
+- Topics are matched exactly (case-insensitively), not by similarity.
+- Local file only: SQLite URLs only, no migrations beyond schema version 1 (a database
+  from a newer version is refused), and `:memory:` is not supported because each
+  operation opens its own connection.
+- Stored lessons and evaluations are plain text and may be sensitive; the database is
+  not encrypted.
+
 ## Testing
 
 ```powershell
-pytest                 # 456 tests, all offline: no API calls, no network
+pytest                 # 491 tests, all offline: no API calls, no network
 ruff check .
 ruff format --check .
 ```
@@ -200,7 +310,9 @@ app/
   agents/              generator, evaluator, improver
   evaluation/          rubric, topics (curriculum), schemas, concept logic
   workflow/            LangGraph state, nodes, graph
-  api/, memory/, main.py   placeholders (not implemented)
+  memory/              SQLite storage, retrieval and history context
+  pipeline.py          memory-enabled entry point (python -m app.pipeline)
+  api/, main.py        placeholders (not implemented)
 tests/                 offline tests and real-run fixtures
 docs/architecture.md   design notes
 outputs/               run results and debug logs (git-ignored)
@@ -226,7 +338,7 @@ outputs/               run results and debug logs (git-ignored)
 - **Genuine inaccuracies can persist.** For example, models like to say "real-time
   information", which RAG does not guarantee. The evaluator flags it, but at most two
   improvements are made, and a rejected run returns the best lesson it produced.
-- **No HTTP API and no persistent storage** (placeholders only). `requirements.txt`
+- **No HTTP API** (placeholders only). `requirements.txt`
   also lists packages not used yet (`langchain`, `langchain-openai`, `python-dotenv`,
   `sqlalchemy`, `uvicorn`, `fastapi`).
 - **Cost and speed:** each model call takes about 20 seconds; a run makes between 2

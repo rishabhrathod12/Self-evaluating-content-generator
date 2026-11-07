@@ -89,7 +89,32 @@ common credential formats and secret-named settings are redacted, the file rotat
 5 MB, and a logging failure can never interrupt a run. The log can contain lesson
 content, so it is git-ignored and should be treated as sensitive.
 
+## Memory
+
+`app/pipeline.py` (`run_with_memory`, or `python -m app.pipeline "<topic>"`) is the
+application entry point. The graph itself is unchanged and never touches the database:
+
+```text
+topic -> MemoryRepository.list_runs / latest_passed_lesson
+      -> build_memory_context  (<= 6 clipped feedback lines + outline of last pass)
+      -> run_workflow(topic, memory_context=...)   generate -> evaluate -> improve*
+      -> MemoryRepository.save_run(final state)    passed | rejected | error
+```
+
+The context lives in the workflow state (`memory_context`, `{}` when there is no
+history). `generate_node` and `improve_node` pass it to the agents only when it is
+non-empty, so without history the calls and prompts are identical to before. The
+generator prompt adds the earlier criticisms and a loose outline reference with an
+instruction not to copy; the improver prompt adds the feedback lines as advice
+subordinate to the current evaluation. Evaluator scoring, the seven criteria and the
+retry limit (2) are not involved.
+
+Failure handling: a memory that cannot be opened or read raises `MemoryDatabaseError`
+before any model call; a failed final save is reported in the result
+(`save_error`) while the finished run is still returned. Free text that is stored
+(error messages, rejection reason) is redacted for credentials first. Storage
+details and limitations are in the README's Memory section.
+
 ## Not implemented
 
-An HTTP API and persistent SQLite storage (`app/api/`, `app/memory/`, `app/main.py`
-are placeholders). Run results are returned as dictionaries and are not stored.
+An HTTP API (`app/api/`, `app/main.py` are placeholders).

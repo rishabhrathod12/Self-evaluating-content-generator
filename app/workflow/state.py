@@ -59,9 +59,16 @@ class WorkflowState(TypedDict):
     latest_lesson: dict[str, Any] | None  # set when a rejected run returns
     latest_evaluation: dict[str, Any] | None  # an earlier, better version
     rejection_reason: str  # why the run was rejected (empty otherwise)
+    # Concise feedback from earlier stored runs of this topic (see app.memory.context).
+    # Empty when there is no history, in which case the agents behave as before.
+    memory_context: dict[str, Any]
 
 
-def initial_state(topic: str, maximum_attempts: int) -> WorkflowState:
+def initial_state(
+    topic: str,
+    maximum_attempts: int,
+    memory_context: dict[str, Any] | None = None,
+) -> WorkflowState:
     """Create the starting state, clamping the retry limit to 0..2."""
     return WorkflowState(
         topic=topic,
@@ -79,4 +86,5 @@ def initial_state(topic: str, maximum_attempts: int) -> WorkflowState:
         latest_lesson=None,
         latest_evaluation=None,
         rejection_reason="",
+        memory_context=memory_context or {},
     )

@@ -1,6 +1,8 @@
 """Lesson generator agent: builds the prompt, calls the LLM, validates the result."""
 
 import json
+from collections.abc import Mapping
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -15,6 +17,7 @@ from app.evaluation.topics import (
     workflow_text,
 )
 from app.llm import generate_text
+from app.memory.context import generator_memory_block
 
 MAX_TOPIC_LENGTH = 200
 
@@ -92,10 +95,15 @@ def _requirements_block(requirements: TopicRequirements) -> str:
     )
 
 
-def build_prompt(topic: str, requirements: TopicRequirements | None = None) -> str:
+def build_prompt(
+    topic: str,
+    requirements: TopicRequirements | None = None,
+    memory: Mapping[str, Any] | None = None,
+) -> str:
     """Build the user prompt: the topic, the curriculum and the JSON schema."""
     schema = json.dumps(LessonContent.model_json_schema(), indent=2)
     curriculum = _requirements_block(requirements) if requirements else ""
+    curriculum += generator_memory_block(memory)
     return (
         f"Write a complete beginner-friendly lesson on: {topic}\n\n{curriculum}"
         "Set learner_level to describe a beginner with no technical background. "
@@ -152,8 +160,13 @@ def parse_lesson(raw: str) -> LessonContent:
 # --- Public API --------------------------------------------------------------------
 
 
-async def generate_lesson(topic: str) -> LessonContent:
+async def generate_lesson(
+    topic: str, memory: Mapping[str, Any] | None = None
+) -> LessonContent:
     """Generate a validated beginner-friendly lesson for ``topic``.
+
+    ``memory`` is optional feedback from earlier stored runs of this topic. It is
+    advice only: the curriculum and rubric above still decide what the lesson needs.
 
     Raises:
         InvalidTopicError: The topic is empty or too long.
@@ -164,7 +177,7 @@ async def generate_lesson(topic: str) -> LessonContent:
     """
     cleaned = validate_topic(topic)
     raw = await generate_text(
-        build_prompt(cleaned, get_requirements(cleaned)),
+        build_prompt(cleaned, get_requirements(cleaned), memory),
         instructions=SYSTEM_INSTRUCTIONS,
     )
     log_event("generator_response", raw=raw)
