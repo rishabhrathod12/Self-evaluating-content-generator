@@ -288,6 +288,31 @@ stored for inspection but are never returned by `latest_passed_lesson`.
 - Stored lessons and evaluations are plain text and may be sensitive; the database is
   not encrypted.
 
+## Live verification
+
+The memory-enabled workflow (`python -m app.pipeline "Introduction to RAG"`, model
+`gpt-4o-mini`) was run live twice in a row against a fresh database:
+
+| Run | History used | Result | Evaluations | Improvements | Saved |
+| --- | --- | --- | --- | --- | --- |
+| 1 | none (empty database) | passed | 2 | 1 | run #1 |
+| 2 | run #1 (`history used from runs: [1]`) | passed | 2 | 1 | run #2 |
+
+**Verified:**
+
+- A finished run is saved automatically, and both runs are stored in SQLite.
+- The second run found the first run's stored feedback and reference outline and fed
+  them into its generator and improver prompts.
+- The stored data was read back correctly from the database file.
+- The seven criteria, evaluator scoring and the retry limit behaved as before.
+- No API key appeared in the output or the database.
+
+**Not proven:** that history improves lesson quality. Both runs needed exactly one
+improvement and passed, so the results show no measurable difference with or without
+history. Two runs on one topic cannot show an effect either way, and the second
+lesson's different wording does not show that it is better. Showing a benefit would
+need many paired runs, ideally on topics where an unaided run tends to be rejected.
+
 ## Testing
 
 ```powershell
@@ -320,10 +345,11 @@ outputs/               run results and debug logs (git-ignored)
 
 ## Known limitations
 
-- **The final code has not been confirmed by a further live run.** It passes all
-  offline tests, including replays of every evaluator response recorded in two live
-  runs. The most recent live run (before the final fixes) ended in an error, which
-  the fixes address; one more live run is the way to confirm.
+- **Live verification is small.** After the final evaluator fixes, live runs of
+  "Introduction to RAG" passed (see [Live verification](#live-verification)), but that
+  is a handful of runs on one topic with one model. Offline tests include replays of
+  every evaluator response recorded in earlier live runs. Other topics have only the
+  seven generic criteria and have not been run live.
 - **The evaluator is a small LLM** (`gpt-4o-mini` by default). Judgements of the seven
   criteria can vary between lessons. Code verifies and corrects what it can, but it
   cannot make the model perfect. Accuracy rests on the model's own knowledge: there is
