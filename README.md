@@ -350,12 +350,14 @@ the run output lists new proposal ids.
 ## Live verification
 
 The memory-enabled workflow (`python -m app.pipeline "Introduction to RAG"`, model
-`gpt-4o-mini`) was run live twice in a row against a fresh database:
+`gpt-4o-mini`) was run live three times against one database. Runs 1 and 2 ran
+back to back on a fresh database; run 3 followed the self-evolution steps below.
 
 | Run | History used | Result | Evaluations | Improvements | Saved |
 | --- | --- | --- | --- | --- | --- |
 | 1 | none (empty database) | passed | 2 | 1 | run #1 |
 | 2 | run #1 (`history used from runs: [1]`) | passed | 2 | 1 | run #2 |
+| 3 | runs #2 and #1, plus 1 approved refinement | passed | 3 | 2 | run #3 |
 
 **Verified:**
 
@@ -366,11 +368,23 @@ The memory-enabled workflow (`python -m app.pipeline "Introduction to RAG"`, mod
 - The seven criteria, evaluator scoring and the retry limit behaved as before.
 - No API key appeared in the output or the database.
 
-**Not proven:** that history improves lesson quality. Both runs needed exactly one
-improvement and passed, so the results show no measurable difference with or without
-history. Two runs on one topic cannot show an effect either way, and the second
-lesson's different wording does not show that it is better. Showing a benefit would
-need many paired runs, ideally on topics where an unaided run tends to be rejected.
+**Self-evolution, run live once (run 3).** Runs 1 and 2 had both failed "Accuracy and
+groundedness" on their first evaluation, so `python -m app.evolve propose` created
+proposal #1 for that pattern (seen in runs 2 and 1). It was approved manually to exercise the flow, and
+then run 3 used it: the context held exactly 1 approved instruction. Run 3 passed and then created
+proposal #2 ("Overall lesson completeness"), which stayed `proposed` and was not used.
+
+Verified for this part: repeated-failure detection on real data, proposal storage,
+approval, use of only the approved version in the next run, and no use of the
+unapproved one.
+
+**Not proven:** that history or approved refinements improve lesson quality. Runs 1
+and 2 each needed one improvement. Run 3, with the refinement, needed more work (3
+evaluations, 2 improvements) and still failed "Accuracy and groundedness" once, so
+there is no sign of a benefit, and no sign of harm either: three runs on one topic
+cannot show an effect either way, and different wording does not show a better
+lesson. Showing a benefit would need many paired runs, ideally on topics where an
+unaided run tends to be rejected.
 
 ## Testing
 
